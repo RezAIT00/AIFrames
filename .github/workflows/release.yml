@@ -1,0 +1,61 @@
+# Builds aiframes.exe on Windows and publishes it as a GitHub Release.
+# The updater (scripts/updater) installs the newest release on every PC that ran Install-AIFrames.
+#
+# Start a release either way:
+#   - Actions tab > Release > Run workflow, and type a version such as v0.2.0
+#   - or push a tag that starts with "v" (GitHub Desktop: History > right-click a commit > Create Tag, then Push)
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to create, e.g. v0.2.0'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the version tag
+        shell: pwsh
+        run: |
+          if ($env:TAG -notmatch '^v\d+\.\d+\.\d+$') { throw "Version must look like v1.2.3 (got '$env:TAG')" }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo build --release --locked -p aiframes-app
+
+      - name: Collect release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target\release\aiframes.exe dist\
+          Copy-Item scripts\updater\Update-AIFrames.ps1, scripts\updater\Install-AIFrames.ps1, scripts\updater\run-hidden.vbs dist\
+          $hash = (Get-FileHash dist\aiframes.exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content dist\aiframes.exe.sha256 "$hash  aiframes.exe" -NoNewline -Encoding ascii
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: AIFrames ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: |
+            dist/aiframes.exe
+            dist/aiframes.exe.sha256
+            dist/Update-AIFrames.ps1
+            dist/Install-AIFrames.ps1
+            dist/run-hidden.vbs

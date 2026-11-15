@@ -15,6 +15,25 @@ everywhere, silent failures). AIFrames stores an edit the way a person thinks ab
   clip moves its animation. Nothing is written twice.
 - **Loud failures.** A reference that can't be resolved is an error with a fix, never a silent 0.
 
+## Install (Windows)
+
+In PowerShell (no admin needed):
+
+```powershell
+irm https://github.com/RezAIT00/AIFrames/releases/latest/download/Install-AIFrames.ps1 | iex
+```
+
+This installs the latest release to `%LOCALAPPDATA%\Programs\AIFrames`, adds a Start menu shortcut, registers
+`.aifr` files, installs ffmpeg with winget if it's missing, and keeps AIFrames up to date from this
+repository's [releases](https://github.com/RezAIT00/AIFrames/releases): at logon, every 15 minutes, and each
+time you start it from the Start menu (never while it's open). The log is in
+`%LOCALAPPDATA%\AIFrames-Updater\update.log`. To remove it all, download `Install-AIFrames.ps1` from a
+release and run it with `-Uninstall`.
+
+**Publishing an update:** on GitHub open **Actions → Release → Run workflow** and enter a new version such
+as `v0.2.0` (or push a tag like `v0.2.0`). The workflow builds `aiframes.exe` and publishes the release;
+installed copies pick it up on their next check.
+
 ## The editor
 
 - **Timeline**: video and audio tracks with filmstrips and waveforms, snapping, Select / Razor / Slip / Slide /

@@ -1,0 +1,75 @@
+# Installs the newest AIFrames release from GitHub.
+#
+#   Update-AIFrames.ps1             # update if a newer release exists (skips while AIFrames is open)
+#   Update-AIFrames.ps1 -Launch     # update (if possible), then start AIFrames with any extra arguments
+#
+# Install-AIFrames.ps1 copies this script to %LOCALAPPDATA%\AIFrames-Updater and runs it at logon,
+# every 15 minutes, and whenever AIFrames is started from the Start menu.
+param(
+    [switch]$Launch,
+    [string]$Repo = 'RezAIT00/AIFrames',
+    [Parameter(ValueFromRemainingArguments = $true)] [string[]]$AppArgs
+)
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+$dest = Join-Path $env:LOCALAPPDATA 'Programs\AIFrames'
+$exe = Join-Path $dest 'aiframes.exe'
+$home_ = Join-Path $env:LOCALAPPDATA 'AIFrames-Updater'
+$stateFile = Join-Path $home_ 'installed.json'
+$logFile = Join-Path $home_ 'update.log'
+New-Item -ItemType Directory -Force $dest, $home_ | Out-Null
+$headers = @{ 'User-Agent' = 'AIFrames-Updater'; 'Accept' = 'application/vnd.github+json' }
+
+function Log($msg) {
+    Add-Content -Path $logFile -Value ('{0:yyyy-MM-dd HH:mm:ss}  {1}' -f (Get-Date), $msg)
+    if ((Get-Item $logFile).Length -gt 256KB) { Get-Content $logFile -Tail 500 | Set-Content $logFile }
+}
+function Asset($release, $name) { $release.assets | Where-Object { $_.name -eq $name } | Select-Object -First 1 }
+function Download($asset, $path) { Invoke-WebRequest -Uri $asset.browser_download_url -Headers @{ 'User-Agent' = 'AIFrames-Updater' } -OutFile $path -UseBasicParsing }
+
+function Update-App {
+    try {
+        $r = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers $headers -TimeoutSec 15
+    } catch {
+        return # offline, rate-limited or no release yet: try again next time
+    }
+    $exeAsset = Asset $r 'aiframes.exe'
+    $sumAsset = Asset $r 'aiframes.exe.sha256'
+    if (-not $exeAsset -or -not $sumAsset) { Log "Release $($r.tag_name) has no aiframes.exe / aiframes.exe.sha256; skipped."; return }
+
+    $sumFile = Join-Path $home_ 'latest.sha256'
+    Download $sumAsset $sumFile
+    $expected = ((Get-Content $sumFile -Raw).Trim() -split '\s+')[0].ToUpper()
+    $installed = if (Test-Path $stateFile) { Get-Content $stateFile -Raw | ConvertFrom-Json } else { $null }
+    if ($installed -and $installed.sha256 -eq $expected -and (Test-Path $exe)) { return }
+
+    if (Get-Process aiframes -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe }) {
+        Log "Update $($r.tag_name) available but AIFrames is open; will retry later."
+        return
+    }
+    $tmp = "$exe.new"
+    Download $exeAsset $tmp
+    if ((Get-FileHash $tmp -Algorithm SHA256).Hash -ne $expected) { Remove-Item $tmp -Force; Log "Download of $($r.tag_name) failed verification."; return }
+    Move-Item $tmp $exe -Force
+    [pscustomobject]@{ version = $r.tag_name; sha256 = $expected; installed = (Get-Date).ToString('s') } | ConvertTo-Json | Set-Content $stateFile -Encoding UTF8
+
+    # First install (or a missing association): register the .aifr file type.
+    if (-not (Test-Path 'HKCU:\Software\Classes\AIFrames.Project')) {
+        Start-Process $exe -ArgumentList '--register', '--quiet' -Wait
+    }
+    Log "Installed AIFrames $($r.tag_name)."
+
+    # Refresh the updater itself from the same release (takes effect next run).
+    foreach ($f in 'Update-AIFrames.ps1', 'run-hidden.vbs') {
+        $a = Asset $r $f
+        if ($a) { try { Download $a (Join-Path $home_ "$f.new"); Move-Item (Join-Path $home_ "$f.new") (Join-Path $home_ $f) -Force } catch { Log "Could not refresh ${f}: $($_.Exception.Message)" } }
+    }
+}
+
+try { Update-App } catch { Log "Update error: $($_.Exception.Message)" }
+
+if ($Launch -and (Test-Path $exe)) {
+    if ($AppArgs) { Start-Process $exe -ArgumentList $AppArgs } else { Start-Process $exe }
+}
