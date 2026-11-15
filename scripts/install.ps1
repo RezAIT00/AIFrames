@@ -2,7 +2,7 @@
 #
 #   scripts\install.ps1                      # build + install + register
 #   scripts\install.ps1 -OpenSettings        # ...and open Settings > Default apps to confirm the default
-#   scripts\install.ps1 -Uninstall           # remove registration, shortcut and installed files
+#   scripts\install.ps1 -Uninstall           # remove registration, shortcut, installed files and the auto-updater
 param(
     [switch]$OpenSettings,
     [switch]$Uninstall,
@@ -16,6 +16,9 @@ $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'AIFrames.lnk'
 Get-Process aiframes -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Stop-Process -Force
 
 if ($Uninstall) {
+    # Also remove the auto-updater (Install-AIFrames.ps1) if present; otherwise it reinstalls AIFrames within 15 minutes.
+    Unregister-ScheduledTask -TaskName 'AIFrames Auto-Update' -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $env:LOCALAPPDATA 'AIFrames-Updater') -Recurse -Force -ErrorAction SilentlyContinue
     if (Test-Path $exe) { Start-Process $exe -ArgumentList '--unregister' -Wait }
     Remove-Item $lnk -ErrorAction SilentlyContinue
     Remove-Item $dest -Recurse -Force -ErrorAction SilentlyContinue

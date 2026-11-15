@@ -25,6 +25,8 @@ jobs:
       TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false # cargo build scripts must not be able to read the write token from .git/config
 
       - name: Check the version tag
         shell: pwsh

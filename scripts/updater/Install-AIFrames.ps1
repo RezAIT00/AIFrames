@@ -57,6 +57,7 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     try { winget install --id Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements } catch { Write-Host 'Could not install ffmpeg automatically; install it manually (winget install Gyan.FFmpeg).' }
 }
 
-$v = (Get-Content (Join-Path $home_ 'installed.json') -Raw | ConvertFrom-Json).version
+# No installed.json when an existing aiframes.exe was kept (e.g. it was open, so the updater waits).
+$v = try { (Get-Content (Join-Path $home_ 'installed.json') -Raw | ConvertFrom-Json).version + ' ' } catch { '' }
 Write-Host ''
-Write-Host "AIFrames $v installed. It updates itself from GitHub releases at logon, every 15 minutes, and when started from the Start menu."
+Write-Host "AIFrames ${v}installed. It updates itself from GitHub releases at logon, every 15 minutes, and when started from the Start menu."

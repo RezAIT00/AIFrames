@@ -27,8 +27,12 @@ This installs the latest release to `%LOCALAPPDATA%\Programs\AIFrames`, adds a S
 `.aifr` files, installs ffmpeg with winget if it's missing, and keeps AIFrames up to date from this
 repository's [releases](https://github.com/RezAIT00/AIFrames/releases): at logon, every 15 minutes, and each
 time you start it from the Start menu (never while it's open). The log is in
-`%LOCALAPPDATA%\AIFrames-Updater\update.log`. To remove it all, download `Install-AIFrames.ps1` from a
-release and run it with `-Uninstall`.
+`%LOCALAPPDATA%\AIFrames-Updater\update.log`. To remove AIFrames, its shortcut, file type, scheduled task and
+updater (ffmpeg stays), run in PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://github.com/RezAIT00/AIFrames/releases/latest/download/Install-AIFrames.ps1))) -Uninstall
+```
 
 **Publishing an update:** on GitHub open **Actions → Release → Run workflow** and enter a new version such
 as `v0.2.0` (or push a tag like `v0.2.0`). The workflow builds `aiframes.exe` and publishes the release;
