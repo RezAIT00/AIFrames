@@ -31,7 +31,7 @@ Usage:
   aiframes describe <project> [--from S --to S] [--json]
   aiframes timeline <project> [--json]
   aiframes validate <project> [--fix] [--severity error|warning|info] [--json]   (exit 1 if errors remain)
-  aiframes apply <project> <ops.json | -> [--plan] [--author A] [--label L] [--json]
+  aiframes apply <project> <ops.json | -> [--plan] [--author A] [--label L] [--base-revision N] [--json]
   aiframes snapshot <project> --at 1,2.5 [-o dir] [--scale 0.5] [--guides]
   aiframes contact-sheet <project> [--every 5 | --count 12] [--cols 4] [--width 320] [-o out.png]
   aiframes render <project> [-o out.mp4] [--preset youtube|1080p|4k|shorts|square|hevc|draft|prores|gif|wav] [--codec C]
@@ -50,7 +50,7 @@ edits stay unsaved there unless --save is given) so the window never overwrites 
 
 const VALUE_FLAGS: &[&str] = &[
     "preset", "name", "fps", "width", "height", "author", "label", "at", "o", "out", "output", "scale", "every", "count", "cols", "codec", "quality", "range",
-    "language", "model", "prompt", "from", "to", "track", "severity", "limit", "size", "fit",
+    "language", "model", "prompt", "from", "to", "track", "severity", "limit", "size", "fit", "base-revision",
 ];
 
 struct Args {
@@ -467,6 +467,9 @@ fn print_receipt(out: &mut dyn Write, r: &J) {
     for d in r["done"].as_array().cloned().unwrap_or_default() {
         let _ = writeln!(out, "  - {}", d.as_str().unwrap_or(""));
     }
+    if let Some(n) = r["applied_over"]["note"].as_str() {
+        let _ = writeln!(out, "  note: {n}");
+    }
     let sp = |v: &J| match v.as_array() {
         Some(x) if x.len() == 2 => format!("{}–{}", secs(x[0].as_f64().unwrap_or(0.0)), secs(x[1].as_f64().unwrap_or(0.0))),
         _ => "—".into(),
@@ -501,6 +504,10 @@ fn cmd_apply(e: &Env, a: &Args, out: &mut dyn Write) -> Res {
     let mut args = json!({"project": id, "ops": ops, "plan": a.has("plan"), "author": a.val("author").unwrap_or("cli")});
     if let Some(l) = a.val("label") {
         args["label"] = json!(l);
+    }
+    // Refuse the ops if the project changed since revision N in a way that affects them.
+    if let Some(n) = a.num("base-revision")? {
+        args["base_revision"] = json!(n);
     }
     let r = e.call("edit", args)?;
     if !a.has("plan") {

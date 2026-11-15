@@ -76,7 +76,9 @@ claude mcp add --transport http aiframes http://127.0.0.1:47675/mcp
 
 49 tools. Typical loop: `changes_since` (what the person did) → `describe_project` → preview footage with
 `contact_sheet {asset}` → `edit` with `plan: true`, then for real → `validate` → `snapshot` / `filmstrip`
-to look → `export`. Text-based editing (`get_transcript`, `delete_words`, `remove_silences`,
+to look → `export`. Edits carry `base_revision` (the revision they were planned against): if the person
+changed something they depend on in the meantime, the edit is refused with what changed instead of
+landing in the wrong place. Text-based editing (`get_transcript`, `delete_words`, `remove_silences`,
 `generate_captions`), analysis (`detect_scenes`, `detect_beats`, `analyze_audio`) and `schema` (every field
 of every type) are there too. Each AI session keeps to its own project, so other windows and tabs are safe.
 

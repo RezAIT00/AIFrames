@@ -493,6 +493,10 @@ fn add_findings(j: &mut J, before: &[Finding], after: &[Finding], dur_before: f6
 
 /// Applies (or with `plan: true` dry-runs) `ops` on the project named by `args` as one undoable
 /// edit by `author` (default "ai"), and returns the receipt with validation context.
+///
+/// With `base_revision` (tools that declare it: edit, suggest) the batch is first checked against
+/// what changed since that revision ([`aiframes_core::Document::check_base`]): a stale batch is
+/// refused with nothing changed, a still-valid one applies and the receipt's `applied_over` says so.
 pub(crate) fn commit(s: &Arc<Services>, args: &J, label: &str, ops: Vec<Op>) -> ToolResult {
     commit_with(s, args, label, ops, |_| {})
 }
@@ -507,6 +511,11 @@ pub(crate) fn commit_with(s: &Arc<Services>, args: &J, label: &str, ops: Vec<Op>
     let notice;
     {
         let mut g = suite_hub::lock(&d);
+        // Checked under the same lock as the apply: the person cannot edit in between.
+        let over = match arg_usize(args, "base_revision")? {
+            Some(base) => g.doc.check_base(base as u64, &ops).map_err(|e| e.to_string())?,
+            None => None,
+        };
         let dur_before = g.doc.resolved().duration;
         if plan {
             let (mut rc, planned) = g.doc.plan_project(&ops).map_err(|e| schema_hint(e.to_string()))?;
@@ -533,6 +542,9 @@ pub(crate) fn commit_with(s: &Arc<Services>, args: &J, label: &str, ops: Vec<Op>
                 j["session"] = json!({"id": x.id, "label": x.label});
             }
             notice = Some(format!("{}: {}", who(&author), rc.label));
+        }
+        if let Some(o) = over {
+            j["applied_over"] = json!({"base_revision": o.base_revision, "newer_changes": o.newer_changes, "by_author": o.by_author, "note": o.note()});
         }
     }
     j["project"] = json!(id);

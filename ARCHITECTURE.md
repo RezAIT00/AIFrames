@@ -104,6 +104,8 @@ impl Document {
     pub fn undo(&mut self) -> Option<Receipt>; pub fn redo(&mut self) -> Option<Receipt>;
     pub fn history(&self) -> &[HistoryEntry];                                 // author, label, time, ops, revision
     pub fn changes_since(&self, revision: u64) -> Vec<&HistoryEntry>;         // "what did the human do since my last turn"
+    pub fn check_base(&self, base_revision: u64, ops: &[Op]) -> Result<Option<AppliedOver>, EditError>;  // stale.rs: refuse ops planned
+                                                                              // against an older revision when newer changes affect them
     pub fn revision(&self) -> u64; pub fn dirty(&self) -> bool; pub fn resolved(&self) -> &Resolved (cached)
     pub fn project_dir(&self) -> PathBuf; pub fn media_path(&self, asset: &MediaAsset) -> PathBuf  // absolute
 }
@@ -226,7 +228,7 @@ Edits are emitted as `Op`s (never mutate the project directly) so the human and 
 `AppSpec { id: "aiframes", name: "AIFrames", title: "AIFrames Video Editor", default_port: 47675, doc_noun: "project", open_tool: "open_project", save_tool: "save_project" }`.
 Tools (all JSON in/out, every edit returns the receipt; `author` = "ai" unless given):
 `list_projects`, `new_project`, `open_project`, `save_project`, `close_project`, `describe_project` (text timeline + notes + open findings),
-`get_timeline` (JSON), `get_clip`, `import_media` (probe + add, folder import, optional transcribe), `list_media`, `edit` (batch of ops, `plan: true` = dry run),
+`get_timeline` (JSON), `get_clip`, `import_media` (probe + add, folder import, optional transcribe), `list_media`, `edit` (batch of ops, `plan: true` = dry run, `base_revision` = refuse it if the person's newer changes affect it),
 `undo`, `redo`, `history` / `changes_since`, `validate`, `snapshot` (PNG frames at times — returned as images), `contact_sheet`, `filmstrip` (frames around a cut),
 `list_effects` / `list_transitions` / `list_ops` (schemas with defaults), `transcribe`, `get_transcript` / `search_transcript` (word indices + timeline times),
 `delete_words`, `generate_captions`, `detect_scenes`, `detect_silence` + `remove_silences` (plan/apply), `detect_beats` (+ markers), `analyze_audio` (loudness over time,

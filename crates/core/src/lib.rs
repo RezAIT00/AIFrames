@@ -22,6 +22,7 @@ pub mod otio;
 pub mod ops;
 pub mod resolve;
 pub mod schema;
+pub mod stale;
 pub mod validate;
 pub mod words;
 
@@ -43,5 +44,6 @@ pub use ops::{
 };
 pub use resolve::{frame_rate, resolve, resolve_raw, snap_to_frame, ResolveError, ResolveErrorKind, Resolved, Span};
 pub use schema::schema_docs;
+pub use stale::{op_use, AppliedOver, OpUse};
 pub use words::{join_words, word_units};
 pub use validate::{validate, Finding, Severity};
