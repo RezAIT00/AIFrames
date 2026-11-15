@@ -1,0 +1,9 @@
+[package]
+name = "suite-shell"
+description = "Windows shell integration for suite apps: per-user file associations and Default Apps registration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"

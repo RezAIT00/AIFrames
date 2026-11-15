@@ -1,0 +1,19 @@
+[package]
+name = "aiframes-render"
+description = "AIFrames renderer: compositor, text and shapes, effects, transitions, audio mixer, export, snapshots"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aiframes-core.workspace = true
+aiframes-media.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+png = "0.18"
+rayon = "1"
+tiny-skia = "0.12"
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
+memory-stats = "1.2"
+
+[dev-dependencies]

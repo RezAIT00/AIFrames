@@ -1,0 +1,10 @@
+[package]
+name = "suite-ui"
+description = "Shared egui building blocks for suite apps: Office-like theme, system font loading, recent files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+egui = { version = "0.37", default-features = false }
+serde_json.workspace = true

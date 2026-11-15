@@ -1,0 +1,11 @@
+[package]
+name = "aiframes-core"
+description = "AIFrames project model: anchored timeline, clip-local animation, typed edit operations with history, resolution and validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+chrono.workspace = true

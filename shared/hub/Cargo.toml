@@ -1,0 +1,8 @@
+[package]
+name = "suite-hub"
+description = "Thread-safe registry of open documents shared by an app's GUI and its MCP server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

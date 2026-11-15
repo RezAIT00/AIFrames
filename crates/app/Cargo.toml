@@ -1,0 +1,28 @@
+[package]
+name = "aiframes-app"
+description = "AIFrames: AI-first video editor (GUI, `aiframes mcp`, CLI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aiframes"
+path = "src/main.rs"
+
+[dependencies]
+aiframes-core.workspace = true
+aiframes-media.workspace = true
+aiframes-render.workspace = true
+aiframes-ui.workspace = true
+aiframes-mcp.workspace = true
+suite-hub.workspace = true
+suite-mcp.workspace = true
+suite-ui.workspace = true
+suite-shell.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "clipboard", "links"] }
+rfd = "0.17.2"
+# Audio output for playback (the audio clock is the master clock).
+cpal = "0.15"

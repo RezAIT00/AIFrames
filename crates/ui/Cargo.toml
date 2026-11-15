@@ -1,0 +1,21 @@
+[package]
+name = "aiframes-ui"
+description = "AIFrames editing widgets (egui): timeline, inspector, effects browser, transcript editor, history, media bin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aiframes-core.workspace = true
+aiframes-media.workspace = true
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+serde_json.workspace = true
+# Installed font families for the text inspector (same version cosmic-text uses in aiframes-render).
+fontdb = { version = "0.23", default-features = false, features = ["std", "fs", "memmap"] }
+
+[dev-dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
+
+[[example]]
+name = "gallery"
+path = "examples/gallery.rs"

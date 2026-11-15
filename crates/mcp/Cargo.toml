@@ -1,0 +1,15 @@
+[package]
+name = "aiframes-mcp"
+description = "AIFrames MCP server, shared GUI/AI services (hub, jobs, actions) and headless CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aiframes-core.workspace = true
+aiframes-media.workspace = true
+aiframes-render.workspace = true
+suite-mcp.workspace = true
+suite-hub.workspace = true
+serde.workspace = true
+serde_json.workspace = true

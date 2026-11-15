@@ -1,0 +1,11 @@
+[package]
+name = "suite-mcp"
+description = "Shared MCP (Model Context Protocol) server framework: JSON-RPC, Streamable HTTP for a live GUI, stdio with GUI proxy/launch, instance discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tiny_http = "0.12"
