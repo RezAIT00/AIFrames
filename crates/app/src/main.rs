@@ -6,9 +6,11 @@
 //! * `aiframes new|import|describe|validate|apply|snapshot|contact-sheet|render|transcribe …`: headless CLI
 //! * `aiframes --register` / `--unregister`: `.aifr` file association
 //! * `aiframes --selftest [--keep]`: end-to-end smoke test (media → project → playback → ops → export)
+//! * `aiframes --bench-playback <project.aifr> [options]`: measures viewer playback (see `bench.rs`)
 
 mod ai;
 mod app;
+mod bench;
 mod dialogs;
 mod edits;
 mod export;
@@ -80,6 +82,10 @@ fn main() {
         Some("--selftest") => {
             attach_console();
             std::process::exit(selftest::run(&args[1..]));
+        }
+        Some("--bench-playback") => {
+            attach_console();
+            std::process::exit(bench::run(&args[1..]));
         }
         Some(cmd) if aiframes_mcp::is_cli_command(cmd) => {
             attach_console();

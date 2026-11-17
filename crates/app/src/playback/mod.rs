@@ -275,6 +275,7 @@ pub struct Engine {
     /// (gen, index, draft) of the frame in the texture.
     displayed: Option<(u64, i64, bool)>,
     shown_size: [usize; 2],
+    shown_image: Option<Arc<ColorImage>>,
     /// (added) Wall time since the frame at the playhead has been missing, and whether that has lasted
     /// long enough to say so.
     loading_since: Option<f64>,
@@ -364,6 +365,7 @@ impl Engine {
             loading_since: None,
             loading: false,
             shown_size: [0, 0],
+            shown_image: None,
             last_played: None,
             stats: Stats { audio: audio_on, ..Default::default() },
             fps_window: VecDeque::new(),
@@ -711,6 +713,7 @@ impl Engine {
                 self.stats.fps = self.fps_window.len() as f32;
             }
             self.shown_size = img.size;
+            self.shown_image = Some(img.clone());
             match &mut self.texture {
                 Some(tex) => tex.set(img, TextureOptions::LINEAR),
                 None => self.texture = Some(self.ctx.load_texture("aiframes-viewer", img, TextureOptions::LINEAR)),
@@ -744,6 +747,18 @@ impl Engine {
 
     pub fn shown(&self) -> Shown {
         Shown { texture: self.texture.as_ref().map(|t| t.id()), size: self.shown_size, draft: self.displayed.is_some_and(|d| d.2), loading: self.loading }
+    }
+
+    /// The frame index on screen and whether it is a draft (current revision only), for
+    /// `--bench-playback`.
+    pub fn displayed_frame(&self) -> Option<(i64, bool)> {
+        let gen = lock(&self.shared.st).gen;
+        self.displayed.filter(|d| d.0 == gen).map(|d| (d.1, d.2))
+    }
+
+    /// The picture on screen (for `--bench-playback`'s wrong-frame check).
+    pub fn shown_image(&self) -> Option<Arc<ColorImage>> {
+        self.shown_image.clone()
     }
 
     /// Bytes of decoded preview frames buffered by the engine.
