@@ -10,6 +10,7 @@ use crate::panels::{self, Cmd, MenuInfo, PanelId, SideTab, StatusInfo, Toast, To
 use crate::playback::{clock::Shuttle, Engine, Quality, Snapshot};
 use crate::prefs::{self, Prefs};
 use crate::previews::{self, Previews};
+use crate::source::{SourceCx, SourceMonitor};
 use crate::shortcuts::{self, Command};
 use crate::theme;
 use crate::timecode::{self, frame_index, frame_time};
@@ -105,6 +106,8 @@ impl DocUi {
 enum Focus {
     Viewer,
     Timeline,
+    /// (added) The Source monitor (transport and mark keys act on it).
+    Source,
     Other,
 }
 
@@ -220,6 +223,9 @@ pub struct AiFramesApp {
     script: Option<crate::script::Script>,
     script_action: Option<crate::script::Frame>,
     exit_in: Option<u32>,
+    /// (added) The Source monitor and whether it was playing last frame (one monitor plays at a time).
+    source: SourceMonitor,
+    source_was_playing: bool,
 }
 
 fn file_name(p: &Path) -> String {
@@ -254,6 +260,8 @@ impl AiFramesApp {
             engine.set_scale(q.scale(0.0, 1920));
         }
         let previews = Previews::new(ctx.clone(), services.pool.clone());
+        let mut source = SourceMonitor::new(ctx.clone(), services.renderer.clone());
+        source.volume = prefs.volume;
         let exe = std::env::current_exe().map(|p| p.display().to_string().trim_start_matches(r"\\?\").to_string()).unwrap_or_else(|_| "aiframes.exe".into());
         let fx = FxPreviews::new(ctx.clone(), services.renderer.clone());
         let mut viewer = Viewer::default();
@@ -316,6 +324,8 @@ impl AiFramesApp {
             script: crate::script::Script::from_env(),
             script_action: None,
             exit_in: None,
+            source,
+            source_was_playing: false,
         };
         for e in startup_errors {
             app.dialogs.alert("Couldn't open file", &e);
@@ -383,6 +393,51 @@ impl AiFramesApp {
                 false
             }
             None => false,
+        }
+    }
+
+    /// (added) Shows `asset` in the Source monitor (double-click in the bin, the AI's request).
+    fn open_source(&mut self, id: u64, asset: &str) {
+        let Some(d) = self.services.hub.get(id) else { return };
+        let g = lock(&d);
+        let dir = g.doc.project_dir();
+        match self.source.open(id, &g.doc.project, &dir, asset) {
+            Ok(()) => {
+                drop(g);
+                self.prefs.layout.show_source = true;
+                self.focus = Focus::Source;
+                self.source.focused = true;
+            }
+            Err(e) => {
+                drop(g);
+                self.toast(ToastKind::Error, e);
+            }
+        }
+    }
+
+    /// (added) Insert / overwrite the Source monitor's marked range at the timeline playhead, then
+    /// move the playhead to the end of the new clip (like Premiere).
+    fn source_edit(&mut self, mode: aiframes_mcp::actions::SourceEdit) {
+        let Some(id) = self.active_id() else { return };
+        let Some(m) = self.source.asset(id).cloned() else {
+            self.status = "Open a file in the Source monitor first (double-click it in the bin)".into();
+            return;
+        };
+        let marks = self.source.marks();
+        let at = self.playhead();
+        let res = self.with_doc(id, |d| aiframes_mcp::actions::source_edit_ops(&d.doc.project, &m.id, marks.in_point, marks.out_point, at, None, mode));
+        match res {
+            Some(Ok(ops)) => {
+                let len = aiframes_mcp::actions::source_range(&m, marks.in_point, marks.out_point).ok().flatten().map(|(a, b)| b - a);
+                let label = format!("{} {}", mode.label(), aiframes_ui::util::media_name(&m));
+                if self.apply(id, &label, ops) {
+                    if let Some(len) = len {
+                        self.seek(at + len, false);
+                    }
+                }
+            }
+            Some(Err(e)) => self.toast(ToastKind::Error, format!("{}: {e}", mode.label())),
+            None => {}
         }
     }
 
@@ -839,6 +894,16 @@ impl AiFramesApp {
             // The AI's bounded play finished.
             g.live.play_until = None;
         }
+        if let Some(v) = g.live.source_request.take() {
+            // (added) The AI shows a file in the Source monitor.
+            let dir = g.doc.project_dir();
+            if self.source.apply_request(id, &g.doc.project, &dir, &v).is_ok() {
+                self.prefs.layout.show_source = true;
+            }
+        } else {
+            let dir = g.doc.project_dir();
+            self.source.sync(id, &g.doc.project, &dir);
+        }
         if let Some(panel) = g.live.panel_request.take() {
             // (added) The AI wants the person to see a side panel (e.g. its suggestions in Review).
             if let Some(t) = SideTab::ALL.into_iter().find(|t| t.id() == panel) {
@@ -1119,6 +1184,7 @@ impl AiFramesApp {
             UiAction::RelinkMedia(asset) => self.relink(id, &asset),
             UiAction::Preview(ops) => self.frame_preview = Some(ops),
             UiAction::PickEffectFile { clip, index, name } => self.pick_effect_file(id, &clip, index, &name),
+            UiAction::OpenSource(asset) => self.open_source(id, &asset),
             #[allow(unreachable_patterns)]
             _ => {}
         }
@@ -1126,6 +1192,16 @@ impl AiFramesApp {
 
     /// Runs a shortcut / menu / transport command.
     fn run(&mut self, c: Command, ctx: &egui::Context) {
+        // (added) The Source monitor: its edits, and transport/mark keys while it has the focus.
+        match c {
+            Command::InsertSource => return self.source_edit(aiframes_mcp::actions::SourceEdit::Insert),
+            Command::OverwriteSource => return self.source_edit(aiframes_mcp::actions::SourceEdit::Overwrite),
+            _ if self.focus == Focus::Source && self.prefs.layout.show_source && SourceMonitor::handles(c) => {
+                let k = ctx.input(|i| i.key_down(Key::K));
+                return self.source.command(c, k);
+            }
+            _ => {}
+        }
         let id = self.active_id();
         let t = self.playhead();
         let fps = self.engine.snapshot().fps();
@@ -1304,6 +1380,7 @@ impl AiFramesApp {
                 self.ai.focus_prompt = true;
             }
             Command::Shortcuts => self.dialogs.shortcuts = true,
+            Command::InsertSource | Command::OverwriteSource => {}
         }
     }
 
@@ -1396,6 +1473,12 @@ impl AiFramesApp {
                     PanelId::Bin => l.show_bin = !l.show_bin,
                     PanelId::Side => l.show_side = !l.show_side,
                     PanelId::Timeline => l.show_timeline = !l.show_timeline,
+                    PanelId::Source => {
+                        l.show_source = !l.show_source;
+                        if !l.show_source {
+                            self.source.pause();
+                        }
+                    }
                 }
             }
             Cmd::Side(t) => {
@@ -2052,7 +2135,7 @@ impl AiFramesApp {
         if ctx.egui_wants_keyboard_input() || self.dialogs.modal.is_some() {
             return out;
         }
-        let viewer_focus = matches!(self.focus, Focus::Viewer | Focus::Timeline);
+        let viewer_focus = matches!(self.focus, Focus::Viewer | Focus::Timeline | Focus::Source);
         ctx.input_mut(|i| {
             let mut consumed = Vec::new();
             for (n, e) in i.events.iter().enumerate() {
@@ -2105,7 +2188,9 @@ impl AiFramesApp {
         let (pressed, pos) = ctx.input(|i| (i.pointer.any_pressed(), i.pointer.interact_pos()));
         if pressed {
             if let Some(p) = pos {
-                self.focus = if self.viewer_rect.contains(p) {
+                self.focus = if self.prefs.layout.show_source && self.source.rect.contains(p) {
+                    Focus::Source
+                } else if self.viewer_rect.contains(p) {
                     Focus::Viewer
                 } else if self.timeline_rect.contains(p) {
                     Focus::Timeline
@@ -2115,6 +2200,7 @@ impl AiFramesApp {
             }
         }
         self.viewer.focused = self.focus == Focus::Viewer;
+        self.source.focused = self.focus == Focus::Source;
     }
 
     /// Window position/size for the next start.
@@ -2336,6 +2422,15 @@ impl eframe::App for AiFramesApp {
                 self.engine.set_scale(scale);
             }
             playhead = self.engine.update();
+            // (added) One monitor plays at a time: the one started last wins.
+            if self.source.playing() && self.engine.playing() {
+                if self.source_was_playing {
+                    self.source.pause();
+                } else {
+                    self.engine.pause();
+                }
+            }
+            self.source_was_playing = self.source.playing();
             self.previews.set_playing(self.engine.playing());
             if let Some(d) = self.docs.get_mut(id) {
                 d.playhead = playhead;
@@ -2415,6 +2510,7 @@ impl eframe::App for AiFramesApp {
                 show_bin: self.prefs.layout.show_bin,
                 show_side: self.prefs.layout.show_side,
                 show_timeline: self.prefs.layout.show_timeline,
+                show_source: self.prefs.layout.show_source,
                 safe: self.viewer.safe,
                 zoom: self.viewer.zoom,
                 quality: self.viewer.quality,
@@ -2624,10 +2720,39 @@ impl eframe::App for AiFramesApp {
                 };
                 let fx_hovered = if self.side_tab == SideTab::Effects && layout.show_side { w.effects.hovered.clone() } else { None };
                 let mut vout = Default::default();
-                let r = egui::CentralPanel::default().frame(egui::Frame::NONE.fill(pal.bg_app).inner_margin(egui::Margin::same(4))).show(ui, |ui| {
+                let mut sout = crate::source::SourceOut::default();
+                let show_source = self.prefs.layout.show_source;
+                let source_w = self.prefs.layout.source_width;
+                let scx = SourceCx { doc: id, preview: &self.previews };
+                let mut source_rect = egui::Rect::NOTHING;
+                let mut viewer_rect = egui::Rect::NOTHING;
+                egui::CentralPanel::default().frame(egui::Frame::NONE.fill(pal.bg_app).inner_margin(egui::Margin::same(4))).show(ui, |ui| {
+                    if show_source {
+                        // (added) The Source monitor, left of the program viewer like Premiere's.
+                        let total = ui.available_width();
+                        let w = if source_w > 0.0 { source_w } else { total * 0.5 };
+                        let max = (total - 260.0).max(240.0);
+                        let r = egui::Panel::left("aif-source").resizable(true).default_size(w.clamp(240.0, max)).size_range(240.0..=max).frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 6, top: 0, bottom: 0 })).show(ui, |ui| {
+                            sout = self.source.ui(ui, &scx);
+                        });
+                        source_rect = r.response.rect;
+                    }
+                    viewer_rect = ui.available_rect_before_wrap();
                     vout = self.viewer.ui(ui, &vcx);
                 });
-                self.viewer_rect = r.response.rect;
+                self.viewer_rect = viewer_rect;
+                if show_source {
+                    self.prefs.layout.source_width = source_rect.width();
+                    self.source.rect = source_rect;
+                } else {
+                    self.source.rect = egui::Rect::NOTHING;
+                    self.source.pause();
+                }
+                if sout.close {
+                    self.prefs.layout.show_source = false;
+                    self.source.pause();
+                }
+                let source_edit_req = sout.edit;
                 let vout: crate::viewer::ViewerOut = vout;
                 actions.extend(vout.actions);
                 commands.extend(vout.commands);
@@ -2637,6 +2762,7 @@ impl eframe::App for AiFramesApp {
                 // Live state for the AI.
                 pd.live.playhead = playhead;
                 pd.live.playing = playing;
+                pd.live.source = self.source.view(id);
                 pd.live.selection = selection.clone();
                 pd.live.in_point = *in_point;
                 pd.live.out_point = *out_point;
@@ -2659,6 +2785,9 @@ impl eframe::App for AiFramesApp {
                 let dcx = DialogCx { project: Some(&pd.doc.project), port: self.port, exe: &self.exe, memory, auto_cache_mb: auto_cache_mb() };
                 dialog_out = self.dialogs.show(&ctx, &dcx);
                 drop(g);
+                if let Some(mode) = source_edit_req {
+                    self.source_edit(mode);
+                }
                 // Live drag preview in the viewer.
                 match (vout.preview, vout.preview_done) {
                     (Some(lp), false) => {

@@ -72,9 +72,20 @@ impl Timeline {
         if ui.selectable_label(self.show_filmstrips, small("Thumbs")).on_hover_text("Filmstrip thumbnails on video clips").clicked() {
             self.show_filmstrips = !self.show_filmstrips;
         }
-        if ui.selectable_label(self.show_waveforms, small("Waves")).on_hover_text("Waveforms on clips with sound").clicked() {
+        let waves = ui.selectable_label(self.show_waveforms, small("Waves")).on_hover_text(format!("Waveforms on clips with sound ({} scale; right-click to change)", if self.wave_log { "dB" } else { "linear" }));
+        if waves.clicked() {
             self.show_waveforms = !self.show_waveforms;
         }
+        waves.context_menu(|ui| {
+            if ui.radio(self.wave_log, "dB scale (quiet sound stays visible)").clicked() {
+                self.wave_log = true;
+                ui.close();
+            }
+            if ui.radio(!self.wave_log, "Linear amplitude").clicked() {
+                self.wave_log = false;
+                ui.close();
+            }
+        });
         ui.separator();
         if ui.button(small("-")).on_hover_text("Zoom out (-)").clicked() {
             self.zoom_by(lay, 1.0 / 1.5, cx.playhead);

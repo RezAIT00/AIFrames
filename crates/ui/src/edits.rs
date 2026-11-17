@@ -909,7 +909,7 @@ pub(crate) mod tests {
         // Below the last track: a new audio track.
         let (q, _) = run(&p, &drop_media_ops(&p, "ma", None, 0.0, false));
         assert_eq!(q.tracks.len(), 5);
-        // Bin double-click at 5 s inserts on the main track.
+        // Bin "Add to timeline at playhead" at 5 s inserts on the main track.
         let ops = add_media_at_ops(&p, &r, "mi", 5.0);
         assert!(matches!(ops[0], Op::InsertClip { .. }));
         let (_, rq) = run(&p, &ops);

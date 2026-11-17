@@ -500,6 +500,7 @@ impl Gallery {
                 UiAction::RelinkMedia(id) => self.status = format!("Relink {id}: file dialog (app shell)."),
                 UiAction::Preview(_) => {}
                 UiAction::PickEffectFile { clip, index, name } => self.status = format!("Pick a file for {name} of effect {index} on {clip} (app shell)."),
+                UiAction::OpenSource(id) => self.status = format!("Open {id} in the Source monitor (app shell)."),
             }
         }
     }

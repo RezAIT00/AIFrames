@@ -738,6 +738,15 @@ pub(crate) fn get_state(s: &Arc<Services>, args: &J) -> ToolResult {
         if let Some(o) = l.out_point {
             j["out_point"] = json!(t3(o));
         }
+        if l.source.asset.is_some() {
+            let mut sm = source_json(id, g, has_ui);
+            for k in ["project", "window", "note", "next"] {
+                if let Some(o) = sm.as_object_mut() {
+                    o.remove(k);
+                }
+            }
+            j["source_monitor"] = sm;
+        }
         if !has_ui {
             j["note"] = json!(NO_WINDOW);
         }
@@ -824,6 +833,110 @@ pub(crate) fn select(s: &Arc<Services>, args: &J) -> ToolResult {
         Ok(j)
     })?;
     s.hub.wake();
+    Ok(res)
+}
+
+/// (Addition) `in` / `out` arguments: absent (keep), `null` (clear) or seconds.
+fn mark_arg(args: &J, key: &str) -> Result<Option<Option<f64>>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(J::Null) => Ok(Some(None)),
+        Some(_) => Ok(Some(arg_f64(args, key)?)),
+    }
+}
+
+/// (Addition) The Source monitor as JSON.
+fn source_json(id: u64, g: &ProjectDoc, has_ui: bool) -> J {
+    let v = &g.live.source;
+    let p = &g.doc.project;
+    let mut j = json!({"project": id, "window": has_ui});
+    match v.asset.as_deref().and_then(|a| p.media.iter().find(|m| m.id == a)) {
+        Some(m) => {
+            j["asset"] = json!(m.id);
+            j["name"] = json!(file_name(&m.path));
+            j["kind"] = json!(m.kind);
+            j["duration"] = json!(t3(m.info.duration));
+            j["playhead"] = json!(t3(v.playhead));
+            j["in"] = json!(v.in_point.map(t3));
+            j["out"] = json!(v.out_point.map(t3));
+            if let Ok(Some((a, b))) = crate::actions::source_range(m, v.in_point, v.out_point) {
+                j["range"] = json!([t3(a), t3(b)]);
+                j["range_seconds"] = json!(t3(b - a));
+            }
+            j["next"] = json!("source_monitor {\"edit\": \"insert\"} (or \"overwrite\") puts this range at the timeline playhead, like the person's , and . keys");
+        }
+        None => {
+            j["asset"] = J::Null;
+            j["next"] = json!("source_monitor {\"asset\": \"m3\", \"in\": 2.0, \"out\": 5.5} shows a file there with marks");
+        }
+    }
+    if !has_ui {
+        j["note"] = json!(NO_WINDOW);
+    }
+    j
+}
+
+/// (Addition) The person's Source monitor: read it, show a file there (with marks and a playhead,
+/// in seconds of the file), or make the Insert / Overwrite edit from it — the same ops the window's
+/// `,` and `.` make (`actions::source_edit_ops`), one undoable step.
+pub(crate) fn source_monitor(s: &Arc<Services>, args: &J) -> ToolResult {
+    let has_ui = s.hub.has_ui();
+    let edit = match arg_str(args, "edit") {
+        Some(e) => Some(crate::actions::SourceEdit::parse(e).ok_or_else(|| format!("'edit' must be \"insert\" or \"overwrite\" (got {e:?})"))?),
+        None => None,
+    };
+    let (set_in, set_out) = (mark_arg(args, "in")?, mark_arg(args, "out")?);
+    if let Some(mode) = edit {
+        // The range: the arguments, else what the person marked in the Source monitor.
+        let (ops, label) = with_doc(s, args, |_, g| {
+            let live = &g.live.source;
+            let asset = arg_str(args, "asset").map(str::to_string).or_else(|| live.asset.clone()).ok_or_else(|| "pass 'asset' (nothing is open in the Source monitor)".to_string())?;
+            let same = live.asset.as_deref() == Some(asset.as_str());
+            let i = set_in.unwrap_or(if same { live.in_point } else { None });
+            let o = set_out.unwrap_or(if same { live.out_point } else { None });
+            let (p, r) = (&g.doc.project, g.doc.resolved());
+            let at = match args.get("time").filter(|v| !v.is_null()) {
+                Some(v) => time_ref(p, r, v)?,
+                None => g.live.playhead,
+            };
+            let ops = crate::actions::source_edit_ops(p, &asset, i, o, at, arg_str(args, "track"), mode)?;
+            Ok::<_, String>((ops, format!("{} {asset}", mode.label())))
+        })?;
+        return commit(s, args, &label, ops);
+    }
+    let show = args.get("asset").is_some_and(|v| !v.is_null()) || set_in.is_some() || set_out.is_some() || args.get("at").is_some_and(|v| !v.is_null());
+    let res = with_doc(s, args, |id, g| {
+        if show {
+            let p = &g.doc.project;
+            let asset = arg_str(args, "asset").map(str::to_string).or_else(|| g.live.source.asset.clone()).ok_or_else(|| "pass 'asset' (a media id from list_media)".to_string())?;
+            let m = p.media.iter().find(|m| m.id == asset).ok_or_else(|| format!("unknown media asset '{asset}'.{}", did_you_mean(&asset, p.media.iter().map(|m| m.id.as_str()))))?;
+            let mut v = if g.live.source.asset.as_deref() == Some(asset.as_str()) { g.live.source.clone() } else { crate::SourceView { asset: Some(asset.clone()), ..Default::default() } };
+            let dur = m.info.duration.max(0.0);
+            let clamp = |t: f64| if dur > 0.0 { t.clamp(0.0, dur) } else { t.max(0.0) };
+            if let Some(i) = set_in {
+                v.in_point = i.map(clamp);
+            }
+            if let Some(o) = set_out {
+                v.out_point = o.map(clamp);
+            }
+            if let (Some(a), Some(b)) = (v.in_point, v.out_point) {
+                if b - a < 1e-3 {
+                    return Err(format!("the out mark ({b:.3} s) must be after the in mark ({a:.3} s)"));
+                }
+            }
+            if let Some(t) = arg_f64(args, "at")? {
+                v.playhead = clamp(t);
+            } else if g.live.source.asset.as_deref() != Some(asset.as_str()) {
+                v.playhead = v.in_point.unwrap_or(0.0);
+            }
+            g.live.source = v.clone();
+            g.live.source_request = Some(v);
+        }
+        Ok(source_json(id, g, has_ui))
+    })?;
+    if show {
+        s.hub.wake();
+    }
     Ok(res)
 }
 

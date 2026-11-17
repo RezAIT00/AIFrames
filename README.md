@@ -40,12 +40,18 @@ installed copies pick it up on their next check.
 
 ## The editor
 
-- **Timeline**: video and audio tracks with filmstrips and waveforms, multi-track audio (a file with several sound
+- **Timeline**: video and audio tracks with filmstrips (sharp on HiDPI screens, stable while zooming) and
+  waveforms (peak and RMS, scaled by clip volume, dB scale by default so quiet sound stays visible), multi-track audio (a file with several sound
   streams, like an OBS recording with game, mic and chat, comes in as the picture plus one linked audio clip per
   stream, each on its own track with its own mute, volume and waveform; the inspector picks a clip's stream), snapping, Select / Razor / Slip / Slide /
   Ripple / Roll tools, live ghost previews of every drag, keyframe lanes and volume lines on the clips,
   transitions on cuts, markers and YouTube chapters, anchor lines showing what follows what, track
   mute/solo/lock/hide and drag-to-reorder, Set spacing / Close gaps.
+- **Media bin and Source monitor**: poster frames (never a black leader) decoded at the screen's real pixel
+  size, hover scrubbing, waveforms for sound files. Double-click a file to open it in the Source monitor beside
+  the program viewer: play it (J/K/L, frame steps), mark in/out (I/O, remembered per file) and Insert (`,`,
+  later clips move right) or Overwrite (`.`) the range at the timeline playhead, or drag the picture onto a
+  track (Ctrl = insert), like Premiere. The AI does the same with `source_monitor`.
 - **Viewer**: smooth playback with the sound as master clock (J/K/L shuttle with 2×/4× audio, scrub audio,
   frame steps, loop in/out), on-canvas move/scale/rotate handles, safe-area guides, render warnings.
 - **Inspector**: everything about the selection, every animatable value with keyframe controls, text (system

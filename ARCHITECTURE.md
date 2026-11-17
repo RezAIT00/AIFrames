@@ -243,7 +243,11 @@ The same `frame` function serves preview (scaled), snapshots and export, so what
 ```rust
 pub struct TimelineState { pub zoom: f64 /* px per second */, pub scroll: f64, pub snapping: bool, pub tool: Tool, ... }
 pub enum Tool { Select, Razor, Slip, Ripple, Roll }
-pub trait MediaPreview { fn thumbnail(&self, asset: &MediaAsset, t: f64) -> Option<egui::TextureId>; fn waveform(&self, asset: &MediaAsset) -> Option<Arc<Waveform>>; }
+pub trait MediaPreview { fn thumbnail(&self, asset: &MediaAsset, t: f64) -> Option<egui::TextureId>; fn waveform(&self, asset: &MediaAsset) -> Option<Arc<Waveform>>;
+    // added (default impls): thumbnail_px(asset, t, physical px, near-seconds stand-in), poster(asset, px), prefetch(asset, times, px), failed(asset)
+}
+// The app's `Previews` (app/src/previews.rs) decodes at the smallest of 54/108/216/432 px covering the box, never blocks, and only
+// shows a stand-in from the same moment or within `near` seconds (no far-away frames while zooming).
 pub struct TimelineCtx<'a> { pub project: &'a Project, pub resolved: &'a Resolved, pub playhead: f64, pub selection: &'a [Id], pub preview: &'a dyn MediaPreview, pub ai_highlight: &'a [Id] }
 pub enum TimelineAction { Seek(f64), Select(Vec<Id>), Apply { label: String, ops: Vec<Op> }, OpenClip(Id), DropMedia { asset: Id, track: Option<Id>, at: f64 }, ContextMenu(..) }
 impl TimelineState { pub fn ui(&mut self, ui: &mut egui::Ui, cx: &TimelineCtx) -> Vec<TimelineAction> }
@@ -260,13 +264,15 @@ Tools (all JSON in/out, every edit returns the receipt; `author` = "ai" unless g
 `list_effects` / `list_transitions` / `list_ops` (schemas with defaults), `preview_effects` (a clip with each effect/transition added, on scratch copies), `transcribe`, `get_transcript` / `search_transcript` (word indices + timeline times),
 `delete_words`, `generate_captions`, `detect_scenes`, `detect_silence` + `remove_silences` (plan/apply), `detect_beats` (+ markers), `analyze_audio` (loudness over time,
 peaks, per-track levels), `export` (background job with progress; `export_status`), `chapters` (YouTube chapter text from chapter markers),
-`play` / `seek` / `select` / `screenshot_ui` (live GUI only), `launch_gui` (headless).
+`play` / `seek` / `select` / `screenshot_ui` (live GUI only), `source_monitor` (the person's Source monitor: read it, show a file
+with marks, or insert/overwrite its range with the same ops as the window's `,` and `.`: `actions::source_edit_ops`), `launch_gui` (headless).
 CLI (same code, headless): `aiframes new|import|describe|validate|apply ops.json|snapshot --at 1,2|contact-sheet|render -o out.mp4|transcribe|mcp`.
 
 ## GUI (aiframes-app)
 
-Dark, dense, Premiere/Resolve-like, using `suite-ui`. Panels: media bin (import dialog, drag-drop from Explorer, thumbnails, info,
-notes), program viewer (play/pause, JKL shuttle, frame step, in/out, safe-area guides, zoom, on-canvas transform handles for the
+Dark, dense, Premiere/Resolve-like, using `suite-ui`. Panels: media bin (import dialog, drag-drop from Explorer, poster frames,
+hover scrubbing, info, notes), Source monitor (`app/src/source.rs`: one file on its own playback `Engine` over a one-clip project, so
+the same renderer and worker threads; marks per file; insert/overwrite; drag the range out as `aiframes_ui::SourceDrag`), program viewer (play/pause, JKL shuttle, frame step, in/out, safe-area guides, zoom, on-canvas transform handles for the
 selected clip), timeline (the widget), inspector (effects first, then clip properties with keyframe toggles + mini curve; one control
 per registry parameter with its units, slider range and reset; live viewer preview while dragging through `UiAction::Preview`, one
 op per drag; text editing, transitions, audio; the selected clip's effect controls are also docked under the effects browser), transcript editor (select words → delete = ripple cut; click word = seek), history panel (every

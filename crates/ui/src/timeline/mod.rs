@@ -111,6 +111,8 @@ pub struct Timeline {
     pub show_waveforms: bool,
     /// (added)
     pub show_filmstrips: bool,
+    /// (added) Waveforms on a dB scale (quiet sound stays visible) instead of linear amplitude.
+    pub wave_log: bool,
     /// (added) Page-scroll to keep the playhead visible while playing.
     pub follow_playhead: bool,
     drag: Option<DragState>,
@@ -264,6 +266,7 @@ impl Default for Timeline {
             linked_selection: true,
             show_waveforms: true,
             show_filmstrips: true,
+            wave_log: true,
             follow_playhead: true,
             drag: None,
             press: None,

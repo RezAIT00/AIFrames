@@ -52,6 +52,30 @@ pub trait MediaPreview {
             None
         }
     }
+    /// (added) A frame of `asset` at source time `t` for a box `px` *physical* pixels tall: the app
+    /// decodes at least that size, so pictures stay sharp on HiDPI screens and in big bin tiles.
+    /// While it loads, a frame already loaded within `near` seconds of `t` stands in (`0` = only
+    /// this moment, at any size); `None` = nothing suitable yet (draw a placeholder).
+    fn thumbnail_px(&self, asset: &MediaAsset, t: f64, px: f32, near: f64) -> Option<egui::TextureId> {
+        let _ = (px, near);
+        self.thumbnail(asset, t)
+    }
+    /// (added) The bin's poster frame: a representative frame of the file, not a black one (fade-ins,
+    /// black leaders), `px` physical pixels tall.
+    fn poster(&self, asset: &MediaAsset, px: f32) -> Option<egui::TextureId> {
+        self.thumbnail_px(asset, asset.info.duration * 0.1, px, f64::INFINITY)
+    }
+    /// (added) Loads these frames in the background at low priority (hover-scrub strips), so later
+    /// `thumbnail_px` calls hit.
+    fn prefetch(&self, asset: &MediaAsset, times: &[f64], px: f32) {
+        let _ = (asset, times, px);
+    }
+    /// (added) No picture could be made from this file (offline, unreadable): widgets say so
+    /// instead of showing "loading" forever.
+    fn failed(&self, asset: &MediaAsset) -> bool {
+        let _ = asset;
+        false
+    }
 }
 
 /// A [`MediaPreview`] that has nothing (tests, headless use).
@@ -140,12 +164,24 @@ pub enum UiAction {
     /// (added) Ask the person for a file for string parameter `name` of effect `index` of `clip` (a
     /// LUT's `.cube`), then `set_effect` it.
     PickEffectFile { clip: Id, index: usize, name: String },
+    /// (added) Open this media asset in the Source monitor (play it, mark in/out, insert/overwrite).
+    OpenSource(Id),
 }
 
 /// Drag-and-drop payload for media dragged from the bin onto the timeline or viewer.
 #[derive(Clone, Debug)]
 pub struct MediaDrag {
     pub asset: Id,
+}
+
+/// (added) Drag-and-drop payload for a marked range dragged from the Source monitor onto the
+/// timeline: `asset` from source second `in_point`, `duration` seconds long (`None`: the default
+/// length, e.g. a still without marks). Dropped like bin media (Ctrl = insert, else overwrite).
+#[derive(Clone, Debug)]
+pub struct SourceDrag {
+    pub asset: Id,
+    pub in_point: f64,
+    pub duration: Option<f64>,
 }
 
 /// (added) Drag-and-drop payload for items dragged from the effects browser: drop an effect on a

@@ -6,7 +6,7 @@ use super::*;
 use crate::style::{self, alpha, rgb, shade};
 use crate::MediaPreview;
 use aiframes_core::{eval, AnchorTarget, Clip, MediaAsset, MediaKind, ShapeKind, Source, Time};
-use egui::epaint::{CubicBezierShape, Mesh};
+use egui::epaint::CubicBezierShape;
 use egui::{Align2, Color32, CornerRadius, FontId, Painter, Shape, Stroke, StrokeKind};
 use std::sync::Arc;
 use wave::WavePyramid;
@@ -51,16 +51,28 @@ pub(crate) struct Look {
     pub track_off: bool,
 }
 
-fn asset_aspect(a: &MediaAsset) -> f32 {
+/// Display aspect of a picture asset. `info.width`/`height` are already the display size (the probe
+/// applies rotation metadata and pixel aspect), so rotated phone footage is portrait here.
+pub(crate) fn asset_aspect(a: &MediaAsset) -> f32 {
     let (w, h) = (a.info.width as f32, a.info.height as f32);
     if w <= 0.0 || h <= 0.0 {
         return 16.0 / 9.0;
     }
-    if a.info.rotation.abs() % 180 == 90 {
-        h / w
-    } else {
-        w / h
+    w / h
+}
+
+/// Seconds between filmstrip frames for tiles `tile_secs` long: the largest power-of-two multiple
+/// of the 0.1 s thumbnail grid that fits in a tile. Zooming by less than 2x keeps half of the
+/// moments, so most tiles keep their picture instead of flickering through new ones.
+pub(crate) fn film_step(tile_secs: f64) -> f64 {
+    let mut g = 0.1;
+    if !tile_secs.is_finite() {
+        return g;
     }
+    while g * 2.0 <= tile_secs && g < 1.0e6 {
+        g *= 2.0;
+    }
+    g
 }
 
 /// Colour of track-matte links, badges and matte-source stripes.
@@ -819,15 +831,25 @@ impl Timeline {
         if vis_r <= vis_l {
             return;
         }
+        // Decoded at the tile's physical size (sharp on HiDPI screens).
+        let px = area.height() * pc.ctx().pixels_per_point();
         let first = ((vis_l - area.left()) / tile_w).floor().max(0.0) as i64;
         let last = ((vis_r - area.left()) / tile_w).ceil() as i64;
         let tile_secs = tile_w as f64 / self.zoom;
+        let step = film_step(tile_secs * eval::source_time(c, 1.0).zip(eval::source_time(c, 0.0)).map(|(b, a)| (b - a).abs()).filter(|r| *r > 1e-6).unwrap_or(1.0));
         for k in first..last.min(first + 240) {
             let x = area.left() + k as f32 * tile_w;
             let tile = Rect::from_min_size(pos2(x, area.top()), vec2(tile_w, area.height()));
             let t_local = ((k as f64 + 0.5) * tile_secs).clamp(0.0, (c.duration - 1e-3).max(0.0));
-            let src = if still || asset.kind == MediaKind::Image { 0.0 } else { eval::source_time(c, t_local).unwrap_or(0.0).max(0.0) };
-            match preview.thumbnail(asset, src) {
+            let src = if still || asset.kind == MediaKind::Image {
+                0.0
+            } else {
+                // On the zoom's grid of moments, inside the clip's source range.
+                let s = eval::source_time(c, t_local).unwrap_or(0.0).max(0.0);
+                let (lo, hi) = eval::source_span(c).unwrap_or((s, s));
+                ((s / step).round() * step).clamp(lo, hi.max(lo))
+            };
+            match preview.thumbnail_px(asset, src, px, step * 1.01) {
                 Some(tex) => {
                     pc.image(tex, tile, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), tint);
                 }
@@ -842,39 +864,34 @@ impl Timeline {
 
     #[allow(clippy::too_many_arguments)]
     fn waveform(&mut self, pc: &Painter, preview: &dyn MediaPreview, c: &Clip, asset: &MediaAsset, span: Span, area: Rect, lay: &Layout, color: Color32, muted: bool) {
-        let mid = area.center().y;
-        let half = (area.height() * 0.5 - 1.0).max(1.0);
+        let rectified = area.height() < wave::RECTIFY_BELOW;
         let stream = match &c.source {
             Source::Media { stream, .. } => *stream,
             _ => 0,
         };
         let Some(pyr) = self.waves.get(preview, asset, stream) else {
-            pc.hline(area.x_range(), mid, Stroke::new(1.0, alpha(color, 0.4)));
+            let y = if rectified { area.bottom() - 1.0 } else { area.center().y };
+            pc.hline(area.x_range(), y, Stroke::new(1.0, alpha(color, 0.4)));
             return;
         };
         let color = if muted { alpha(rgb(0x90, 0x90, 0x90), 0.5) } else { color };
-        let x0 = area.left().max(lay.lanes.left()).floor();
-        let x1 = area.right().min(lay.lanes.right()).ceil();
-        let px = 1.0 / self.zoom;
-        let mut mesh = Mesh::default();
-        let mut x = x0;
-        while x < x1 {
-            let tl0 = lay.tmap.t(x) - span.start;
-            let tl1 = tl0 + px;
-            if tl1 >= 0.0 && tl0 <= c.duration {
-                let (a, b) = (tl0.max(0.0), tl1.min(c.duration));
-                if let (Some(s0), Some(s1)) = (eval::source_time(c, a), eval::source_time(c, b)) {
-                    let (lo, hi) = if s0 <= s1 { (s0, s1) } else { (s1, s0) };
-                    let (mn, mx) = pyr.range(lo, hi.max(lo + 1e-4));
-                    let g = (eval::sample(&c.volume, a) * eval::fade_gain(c, a)).clamp(0.0, 4.0) as f32;
-                    let top = mid - (mx * g).min(1.0) * half;
-                    let bot = mid - (mn * g).max(-1.0) * half;
-                    mesh.add_colored_rect(Rect::from_min_max(pos2(x, top.min(mid - 0.5)), pos2(x + 1.0, bot.max(mid + 0.5))), color);
-                }
+        let x0 = area.left().max(lay.lanes.left());
+        let x1 = area.right().min(lay.lanes.right());
+        let look = wave::WaveLook { color, log: self.wave_log, rectified, ppp: pc.ctx().pixels_per_point() };
+        wave::paint(pc, area, x0, x1, look, |a, b| {
+            let tl0 = lay.tmap.t(a) - span.start;
+            let tl1 = lay.tmap.t(b) - span.start;
+            if tl1 < 0.0 || tl0 > c.duration {
+                return None;
             }
-            x += 1.0;
-        }
-        pc.add(Shape::mesh(mesh));
+            let (ta, tb) = (tl0.max(0.0), tl1.min(c.duration));
+            let (s0, s1) = (eval::source_time(c, ta)?, eval::source_time(c, tb)?);
+            let (lo, hi) = if s0 <= s1 { (s0, s1) } else { (s1, s0) };
+            let hi = hi.max(lo + 1e-4);
+            let (mn, mx) = pyr.range(lo, hi);
+            let g = (eval::sample(&c.volume, ta) * eval::fade_gain(c, ta)).clamp(0.0, 16.0) as f32;
+            Some(wave::Column { min: mn * g, max: mx * g, rms: pyr.rms(lo, hi) * g })
+        });
     }
 }
 
@@ -908,6 +925,41 @@ fn paint_transitions(pl: &Painter, p: &Project, r: &Resolved, lay: &Layout, cx: 
         pl.rect_stroke(rect, CornerRadius::same(3), if sel { Stroke::new(1.5, style::SELECT) } else { Stroke::new(1.0, alpha(Color32::BLACK, 0.5)) }, StrokeKind::Inside);
         if cx.is_ai(&t.id) {
             style::glow(pl, rect, style::AI, 0.35 + 0.65 * cx.ai_flash);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotated_footage_keeps_its_display_aspect() {
+        // The probe reports the display size: a phone clip recorded 1920x1080 with a 90 degree
+        // rotation is 1080x1920 here, and its filmstrip tiles are portrait (they were drawn 16:9,
+        // squashing the picture, when the rotation was applied a second time).
+        let mut a: MediaAsset = serde_json::from_value(serde_json::json!({"id": "m1", "path": "p.mp4", "kind": "video", "info": {"width": 1080, "height": 1920, "rotation": 90}})).unwrap();
+        assert!((asset_aspect(&a) - 1080.0 / 1920.0).abs() < 1e-6);
+        a.info.rotation = 0;
+        assert!((asset_aspect(&a) - 1080.0 / 1920.0).abs() < 1e-6);
+        a.info.width = 0;
+        assert!((asset_aspect(&a) - 16.0 / 9.0).abs() < 1e-6, "unknown size: 16:9");
+    }
+
+    #[test]
+    fn filmstrip_moments_survive_zooming() {
+        assert_eq!(film_step(0.05), 0.1, "finer than the thumbnail grid: the grid");
+        assert!((film_step(0.75) - 0.4).abs() < 1e-9);
+        assert!((film_step(30.0) - 25.6).abs() < 1e-9);
+        assert_eq!(film_step(f64::NAN), 0.1);
+        // One zoom step (1.4x) in: every moment of the coarser strip is still on the finer grid,
+        // so those tiles keep their (cached) picture.
+        for tile in [0.3, 0.75, 2.0, 9.0, 41.0] {
+            let (coarse, fine) = (film_step(tile), film_step(tile / 1.4));
+            let r = coarse / fine;
+            assert!((r - r.round()).abs() < 1e-9 && r >= 1.0, "{tile}: {coarse} / {fine}");
+            // Neighbouring tiles never land on the same moment.
+            assert!(fine <= tile / 1.4 + 1e-9);
         }
     }
 }
