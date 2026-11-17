@@ -260,6 +260,9 @@ Playback engine (`app/src/playback`): render workers render ahead of the playhea
 clock) is the master clock, and the clock waits at the start of a play until its first frames are rendered. Every Play, seek
 while playing and loop wrap starts a new *run*: buffered frames of another position are dropped and the frame on screen never
 holds back the new run's frames. While scrubbing, drafts follow the pointer, the newest finished one is shown when the exact
-frame is not ready, and the full frame is rendered once the playhead rests. Auto preview quality lowers the render scale one
-step after 1.5 s of playback dropping more than 12% of its frames while no decoder had to seek (a seek is not a resolution
-problem), and raises it after 15 s without drops. `aiframes --bench-playback` measures all of this (`app/src/bench.rs`).
+frame is not ready, and the full frame is rendered once the playhead rests. At 1x the frame shown is paced: within a quarter
+frame of a boundary the next frame after the last one shown is taken, so 60p on a 60 Hz display shows every frame once.
+Auto preview quality lowers the render scale one step when playback keeps dropping more than 12% of its frames for 3 s with
+no decoder seeking in or 2.5 s before that time (a seek is not a resolution problem; each step restarts the decoders, so at
+most one step per 4 s), and raises it after 15 s without drops. `aiframes --bench-playback` measures all of this
+(`app/src/bench.rs`).
