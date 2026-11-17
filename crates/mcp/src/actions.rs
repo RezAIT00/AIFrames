@@ -928,7 +928,9 @@ pub fn source_range(m: &MediaAsset, in_point: Option<f64>, out_point: Option<f64
 /// Ops for a Source-monitor edit: `asset` from source second `in_point` to `out_point` (default:
 /// the whole file) placed at timeline second `at` on `track` (default: the main video track for
 /// pictures, the first unlocked audio track for sound; created when missing). One undoable step for
-/// the person and the AI alike: `insert_clip` (ripple) or `add_clip` with `overwrite`.
+/// the person and the AI alike: `insert_clip` (ripple) or `add_clip` with `overwrite`. A file with
+/// several sound streams also gets one linked audio clip per stream, each on its own audio track
+/// (`detach_streams`), as when it is dropped on the timeline.
 pub fn source_edit_ops(p: &Project, asset: &str, in_point: Option<f64>, out_point: Option<f64>, at: f64, track: Option<&str>, mode: SourceEdit) -> Result<Vec<Op>, String> {
     let m = p.media.iter().find(|m| m.id == asset).ok_or_else(|| format!("unknown media asset '{asset}'"))?;
     if !at.is_finite() {
@@ -975,6 +977,15 @@ pub fn source_edit_ops(p: &Project, asset: &str, in_point: Option<f64>, out_poin
         }
         clip["duration"] = json!(b - a);
     }
+    // Several sound streams (OBS game/mic/chat): the clip gets an id so `detach_streams` can give
+    // every stream its own linked audio clip, the same as every other way of placing the file.
+    let streams = if m.kind != MediaKind::Image && m.info.audio_stream_count() > 1 {
+        let id = IdGen::new(p).fresh("c");
+        clip["id"] = json!(id);
+        Some(op(json!({"op": "detach_streams", "clip": id}))?)
+    } else {
+        None
+    };
     match mode {
         SourceEdit::Insert => ops.push(op(json!({"op": "insert_clip", "track": track, "at": at, "clip": clip}))?),
         SourceEdit::Overwrite => {
@@ -983,6 +994,7 @@ pub fn source_edit_ops(p: &Project, asset: &str, in_point: Option<f64>, out_poin
             ops.push(op(json!({"op": "add_clip", "clip": clip, "overwrite": true}))?);
         }
     }
+    ops.extend(streams);
     Ok(ops)
 }
 
@@ -1124,5 +1136,46 @@ mod tests {
         aiframes_core::apply_batch(&mut p, &ops).unwrap();
         assert_eq!(SourceEdit::parse(" Overwrite "), Some(SourceEdit::Overwrite));
         assert_eq!(SourceEdit::parse("lift"), None);
+    }
+
+    #[test]
+    fn source_edits_of_multi_stream_files_link_one_audio_clip_per_stream() {
+        let p: Project = serde_json::from_value(json!({
+            "format": 1,
+            "settings": {"width": 1920, "height": 1080, "fps": 30.0},
+            "tracks": [{"id": "v1", "kind": "video", "role": "main"}, {"id": "a1", "kind": "audio"}],
+            "media": [
+                {"id": "mo", "path": "obs.mkv", "kind": "video", "info": {"duration": 30.0, "width": 1920, "height": 1080, "fps": 30.0, "has_video": true, "has_audio": true,
+                    "audio_streams": [{"channels": 2, "rate": 48000, "title": "Game"}, {"channels": 1, "rate": 48000, "title": "Mic"}, {"channels": 2, "rate": 48000, "title": "Discord"}]}}
+            ],
+            "clips": [
+                {"id": "c1", "track": "v1", "start": 0.0, "duration": 4.0, "source": {"type": "media", "asset": "mo", "in_point": 0.0}}
+            ]
+        }))
+        .unwrap();
+        for mode in [SourceEdit::Insert, SourceEdit::Overwrite] {
+            let ops = source_edit_ops(&p, "mo", Some(5.0), Some(7.0), 2.0, None, mode).unwrap();
+            assert!(matches!(ops.last(), Some(Op::DetachStreams { .. })), "{mode:?}: {ops:?}");
+            let mut q = p.clone();
+            aiframes_core::apply_batch(&mut q, &ops).unwrap();
+            let pic = q.clips.iter().find(|c| c.id != "c1" && c.track == "v1" && matches!(&c.source, Source::Media { in_point, .. } if (*in_point - 5.0).abs() < 1e-9)).expect("the placed clip");
+            let mut streams: Vec<(u32, String)> = aiframes_core::linked_partners(&q, &pic.id)
+                .iter()
+                .filter_map(|id| q.clips.iter().find(|c| &c.id == id))
+                .filter_map(|c| match &c.source {
+                    Source::Media { stream, .. } => Some((*stream, c.track.clone())),
+                    _ => None,
+                })
+                .collect();
+            streams.sort();
+            assert_eq!(streams.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0, 1, 2], "{mode:?}: {streams:?}");
+            let tracks: std::collections::HashSet<&String> = streams.iter().map(|s| &s.1).collect();
+            assert_eq!(tracks.len(), 3, "{mode:?}: each stream on its own track");
+        }
+        // A file with one sound stream is placed as one clip, as before.
+        let mut single = p.clone();
+        single.media[0].info.audio_streams.clear();
+        let ops = source_edit_ops(&single, "mo", None, None, 0.0, None, SourceEdit::Insert).unwrap();
+        assert!(!ops.iter().any(|o| matches!(o, Op::DetachStreams { .. })), "{ops:?}");
     }
 }

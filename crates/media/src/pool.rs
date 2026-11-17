@@ -1269,6 +1269,7 @@ mod tests {
             info: MediaInfo { codec: codec.into(), width: w, height: h, ..Default::default() },
             video_index: Some(0),
             audio_index: None,
+            audio_streams: Vec::new(),
             video_end: 10.0,
             video_start: 0.0,
             video_end_exact: true,

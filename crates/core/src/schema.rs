@@ -671,7 +671,7 @@ pub fn schema_docs() -> Value {
             ],
         },
         "source_edit": {
-            "about": "Three-point editing from the Source monitor (Premiere's Insert `,` and Overwrite `.`): a range of a media file (in_point .. in_point + duration, seconds of the file) goes into the timeline at a time. Both are ordinary ops; the source_monitor tool builds them exactly as the window does (default track: the main video track for pictures, the first audio track for sound; no marks = the whole file).",
+            "about": "Three-point editing from the Source monitor (Premiere's Insert `,` and Overwrite `.`): a range of a media file (in_point .. in_point + duration, seconds of the file) goes into the timeline at a time. Both are ordinary ops; the source_monitor tool builds them exactly as the window does (default track: the main video track for pictures, the first audio track for sound; no marks = the whole file; a file with several sound streams also gets detach_streams, one linked audio clip per stream on its own audio track, as when it is dropped).",
             "forms": [
                 {"form": "insert", "meaning": "insert_clip at `at`: a clip under `at` is split and later clips on that track move right by the new clip's length.", "example": {"op": "insert_clip", "track": "v1", "at": 12.0, "clip": {"asset": "m3", "in_point": 4.5, "duration": 2.0}}},
                 {"form": "overwrite", "meaning": "add_clip with overwrite: whatever is under the new clip on its track is trimmed or removed; nothing moves.", "example": {"op": "add_clip", "clip": {"track": "v1", "asset": "m3", "start": 12.0, "in_point": 4.5, "duration": 2.0}, "overwrite": true}},
