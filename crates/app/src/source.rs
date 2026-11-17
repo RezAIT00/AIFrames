@@ -447,7 +447,31 @@ impl SourceMonitor {
         if resp.clicked() {
             self.command(Command::PlayPause, false);
         }
-        resp.on_hover_text("Click: play / pause · I / O mark in / out · , insert · . overwrite (at the timeline playhead)");
+        // Drag the marked range onto the timeline (Ctrl = insert, else overwrite), like Premiere.
+        if let Ok(range) = aiframes_mcp::actions::source_range(&m, marks.in_point, marks.out_point) {
+            let (in_point, duration) = match range {
+                Some((a, b)) => (a, Some(b - a)),
+                None => (0.0, None),
+            };
+            resp.dnd_set_drag_payload(aiframes_ui::SourceDrag { asset: m.id.clone(), in_point, duration });
+            if resp.dragged() {
+                if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                    let lp = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("aif-source-drag")));
+                    let r = Rect::from_min_size(pos + vec2(-108.0, -76.0), vec2(96.0, 54.0));
+                    lp.rect_filled(r.expand(2.0), 4.0, Color32::from_black_alpha(200));
+                    if let Some(tex) = self.engine.as_ref().and_then(|e| e.shown().texture).filter(|_| m.kind != MediaKind::Audio) {
+                        let k = (r.width() / sw).min(r.height() / sh);
+                        lp.image(tex, Rect::from_center_size(r.center(), vec2(sw * k, sh * k)), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                    }
+                    let what = match duration {
+                        Some(d) => format!("{} · {}", aiframes_ui::util::media_name(&m), timecode::short_duration(d)),
+                        None => aiframes_ui::util::media_name(&m),
+                    };
+                    lp.text(r.left_bottom() + vec2(0.0, 4.0), Align2::LEFT_TOP, what, FontId::proportional(10.5), Color32::WHITE);
+                }
+            }
+        }
+        resp.on_hover_text("Click: play / pause · drag to the timeline (Ctrl = insert) · I / O mark in / out · , insert · . overwrite (at the timeline playhead)");
 
         // Scrub bar with the marked range.
         let (bar, bresp) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::click_and_drag());

@@ -156,6 +156,16 @@ pub struct MediaDrag {
     pub asset: Id,
 }
 
+/// (added) Drag-and-drop payload for a marked range dragged from the Source monitor onto the
+/// timeline: `asset` from source second `in_point`, `duration` seconds long (`None`: the default
+/// length, e.g. a still without marks). Dropped like bin media (Ctrl = insert, else overwrite).
+#[derive(Clone, Debug)]
+pub struct SourceDrag {
+    pub asset: Id,
+    pub in_point: f64,
+    pub duration: Option<f64>,
+}
+
 /// (added) Drag-and-drop payload for items dragged from the effects browser: drop an effect on a
 /// clip, a transition on a cut, a text/shape preset at a time on a track.
 pub use effects_browser::BrowserDrag;

@@ -224,8 +224,27 @@ impl Timeline {
                 self.set_preview(cx, Owner::Drop, label, ops, hints, info);
             }
         }
-        if let (Some(drag), Some(pos)) = (resp.dnd_release_payload::<MediaDrag>(), pos) {
+        if let (Some(drag), Some(pos)) = (released::<MediaDrag>(resp), pos) {
             if let Some((label, ops, _, _)) = self.media_drop(cx, lay, &drag.asset, pos, mods) {
+                if !ops.is_empty() {
+                    out.push(match simulate(cx.project, cx.resolved, &ops) {
+                        Ok(_) => UiAction::Apply { label, ops },
+                        Err(e) => UiAction::Status(format!("Not added: {e}")),
+                    });
+                }
+            }
+            self.preview = None;
+            active = false;
+        }
+        // (added) A marked range dragged from the Source monitor.
+        if let (Some(drag), Some(pos)) = (resp.dnd_hover_payload::<crate::SourceDrag>(), pos) {
+            active = true;
+            if let Some((label, ops, hints, info)) = self.media_drop_range(cx, lay, &drag.asset, Some((drag.in_point, drag.duration)), pos, mods) {
+                self.set_preview(cx, Owner::Drop, label, ops, hints, info);
+            }
+        }
+        if let (Some(drag), Some(pos)) = (released::<crate::SourceDrag>(resp), pos) {
+            if let Some((label, ops, _, _)) = self.media_drop_range(cx, lay, &drag.asset, Some((drag.in_point, drag.duration)), pos, mods) {
                 if !ops.is_empty() {
                     out.push(match simulate(cx.project, cx.resolved, &ops) {
                         Ok(_) => UiAction::Apply { label, ops },
@@ -241,7 +260,7 @@ impl Timeline {
             let (label, ops, info) = self.browser_drop(cx, lay, &item, pos);
             self.set_preview(cx, Owner::Drop, label, ops, vec![], info);
         }
-        if let (Some(item), Some(pos)) = (resp.dnd_release_payload::<BrowserDrag>(), pos) {
+        if let (Some(item), Some(pos)) = (released::<BrowserDrag>(resp), pos) {
             let (label, ops, info) = self.browser_drop(cx, lay, &item, pos);
             if ops.is_empty() {
                 out.push(UiAction::Status(info));
@@ -262,13 +281,19 @@ impl Timeline {
 
     #[allow(clippy::type_complexity)]
     fn media_drop(&mut self, cx: &EditCtx, lay: &Layout, asset: &str, pos: Pos2, mods: Modifiers) -> Option<(String, Vec<Op>, Vec<(Id, Span)>, String)> {
+        self.media_drop_range(cx, lay, asset, None, pos, mods)
+    }
+
+    /// A media drop, optionally of a source range (`in_point`, `duration`) from the Source monitor.
+    #[allow(clippy::type_complexity)]
+    fn media_drop_range(&mut self, cx: &EditCtx, lay: &Layout, asset: &str, range: Option<(f64, Option<f64>)>, pos: Pos2, mods: Modifiers) -> Option<(String, Vec<Op>, Vec<(Id, Span)>, String)> {
         let p = cx.project;
         let m = p.media.iter().find(|m| m.id == asset)?;
         let kind = if m.kind == aiframes_core::MediaKind::Audio { TrackKind::Audio } else { TrackKind::Video };
         let below = pos.y >= lay.rows_bottom();
         let row = if below { None } else { geom::nearest_row_of_kind(&lay.rows, pos.y - lay.y0, kind) };
         let track = row.map(|i| lay.rows[i].track.clone());
-        let len = edits::media_clip_len(p, asset);
+        let len = range.and_then(|r| r.1).unwrap_or_else(|| edits::media_clip_len(p, asset));
         let mut t = util::quantize(lay.tmap.t(pos.x).max(0.0), lay.fps);
         if self.snapping && !mods.alt {
             if let Some((d, at)) = snap::snap_edges(&[t, t + len], &self.snap_targets(cx, &HashSet::new()), self.zoom, snap::SNAP_PX) {
@@ -277,7 +302,10 @@ impl Timeline {
             }
         }
         let insert = mods.command;
-        let ops = edits::drop_media_ops(p, asset, track.as_deref(), t, insert);
+        let mut ops = edits::drop_media_ops(p, asset, track.as_deref(), t, insert);
+        if let Some(range) = range {
+            with_source_range(&mut ops, m.kind == aiframes_core::MediaKind::Image, range);
+        }
         let name = util::media_name(m);
         let label = format!("{} {name}", if insert { "Insert" } else { "Add" });
         let info = format!(
@@ -318,6 +346,32 @@ impl Timeline {
             BrowserDrag::Shape(preset) => {
                 let ops = edits::shape_preset_ops(p, r, *preset, t, row_track.as_deref());
                 (format!("Add {}", preset.label()), ops, format!("{} at {}", preset.label(), util::timecode(t, lay.fps)))
+            }
+        }
+    }
+}
+
+/// (added) The payload of type `T` dropped on `resp`. egui's `dnd_release_payload` takes the payload
+/// whatever its type (and drops it when the type differs), so asking for a bin drop first lost an
+/// effects-browser or Source-monitor drop released on the timeline: ask only for the type carried.
+fn released<T: std::any::Any + Send + Sync>(resp: &Response) -> Option<std::sync::Arc<T>> {
+    if egui::DragAndDrop::has_payload_of_type::<T>(&resp.ctx) {
+        resp.dnd_release_payload::<T>()
+    } else {
+        None
+    }
+}
+
+/// (added) Makes the clip a media drop creates use a Source-monitor range: it starts at `in_point`
+/// (not for stills) and lasts `duration` (when given).
+pub(crate) fn with_source_range(ops: &mut [Op], still: bool, (in_point, duration): (f64, Option<f64>)) {
+    for op in ops.iter_mut() {
+        if let Op::AddClip { clip, .. } | Op::InsertClip { clip, .. } = op {
+            if !still {
+                clip["in_point"] = serde_json::json!(in_point);
+            }
+            if let Some(d) = duration {
+                clip["duration"] = serde_json::json!(d);
             }
         }
     }
@@ -428,5 +482,27 @@ mod tests {
         assert_eq!(rq.marker(&q.markers[0].id), Some(3.0));
         assert!(matches!(key_actions(KeyCmd::SelectAll, &cx(&p, &r, 0.0, &[]))[0], UiAction::Select(ref v) if v.len() == 3));
         assert!(matches!(key_actions(KeyCmd::End, &cx(&p, &r, 0.0, &[]))[0], UiAction::Seek(t) if t == 20.0));
+    }
+
+    #[test]
+    fn source_ranges_shape_dropped_clips() {
+        let p = demo();
+        let r = aiframes_core::resolve(&p);
+        for insert in [false, true] {
+            let mut ops = edits::drop_media_ops(&p, "mv", Some("v1"), 30.0, insert);
+            with_source_range(&mut ops, false, (2.0, Some(1.5)));
+            let mut q = p.clone();
+            aiframes_core::apply_batch(&mut q, &ops).unwrap();
+            let c = q.clips.iter().find(|c| !p.clips.iter().any(|o| o.id == c.id)).expect("new clip");
+            assert!((c.duration - 1.5).abs() < 1e-9, "{insert}: {}", c.duration);
+            assert!(matches!(&c.source, aiframes_core::Source::Media { in_point, .. } if (*in_point - 2.0).abs() < 1e-9));
+        }
+        // Stills: no in point, the marked length.
+        let mut ops = edits::drop_media_ops(&p, "mi", Some("v1"), 40.0, false);
+        with_source_range(&mut ops, true, (0.0, Some(2.0)));
+        let mut q = p.clone();
+        aiframes_core::apply_batch(&mut q, &ops).unwrap();
+        assert!((q.clips.last().unwrap().duration - 2.0).abs() < 1e-9);
+        let _ = r;
     }
 }

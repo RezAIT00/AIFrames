@@ -245,7 +245,7 @@ CLI (same code, headless): `aiframes new|import|describe|validate|apply ops.json
 
 Dark, dense, Premiere/Resolve-like, using `suite-ui`. Panels: media bin (import dialog, drag-drop from Explorer, poster frames,
 hover scrubbing, info, notes), Source monitor (`app/src/source.rs`: one file on its own playback `Engine` over a one-clip project, so
-the same renderer and worker threads; marks per file; insert/overwrite), program viewer (play/pause, JKL shuttle, frame step, in/out, safe-area guides, zoom, on-canvas transform handles for the
+the same renderer and worker threads; marks per file; insert/overwrite; drag the range out as `aiframes_ui::SourceDrag`), program viewer (play/pause, JKL shuttle, frame step, in/out, safe-area guides, zoom, on-canvas transform handles for the
 selected clip), timeline (the widget), inspector (clip properties with keyframe toggles + mini curve, effects stack from the registry,
 text editing, transitions, audio), transcript editor (select words → delete = ripple cut; click word = seek), history panel (every
 entry with its author; AI entries highlighted; undo), AI panel (prompt box that runs Claude Code headless against this window's
