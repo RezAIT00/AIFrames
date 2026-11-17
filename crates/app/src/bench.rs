@@ -319,8 +319,9 @@ impl Bench<'_> {
         self.e.reset_stats();
         self.e.play(from, 1.0, None);
         let mut shown: HashSet<i64> = HashSet::new();
-        // The picture on screen is from the playhead's range (a cold start still shows the old position).
-        let in_play = |i: i64, cf: i64| i >= start_frame && i <= cf.max(start_frame);
+        // The picture on screen is from the playhead's range (a cold start still shows the old
+        // position); frame pacing may show the next frame a quarter frame early.
+        let in_play = |i: i64, cf: i64| i >= start_frame && i <= cf.max(start_frame) + 1;
         let mut last: Option<i64> = None;
         let mut last_change = 0.0f64;
         let mut first_frame: Option<f64> = None;
@@ -475,7 +476,7 @@ impl Bench<'_> {
             let cf = frame_index(e.time(), fps);
             end = end.max(cf);
             if let Some((i, false)) = e.displayed_frame() {
-                if i >= target && i <= cf {
+                if i >= target && i <= cf + 1 {
                     first.get_or_insert(w);
                     shown.insert(i);
                 }
@@ -487,7 +488,7 @@ impl Bench<'_> {
         json!({
             "first_frame_ms": first.map(|w| r1(w * 1000.0)),
             "expected": expected,
-            "dropped_pct": r1((expected - shown.len() as i64) as f64 * 100.0 / expected as f64),
+            "dropped_pct": r1((expected - shown.len() as i64).max(0) as f64 * 100.0 / expected as f64),
         })
     }
 

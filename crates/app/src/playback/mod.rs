@@ -38,11 +38,16 @@ const PREROLL: i64 = 6;
 const FRAME_BUDGET: usize = 192 << 20;
 /// Render scales Auto quality steps through when playback cannot keep up (as `schedule::auto_scale`).
 const SCALE_STEPS: [f32; 5] = [0.25, 0.375, 0.5, 0.75, 1.0];
-/// Auto quality lowers the scale when more than this share of frames was dropped over
-/// `DROP_WINDOW` seconds of playback (not counting the first `SETTLE` seconds after Play).
+/// Auto quality lowers the scale when more than this share of frames was dropped in every
+/// `DROP_WINDOW` seconds of playback for another `DROP_WINDOW` (not counting the first `SETTLE`
+/// seconds after the picture starts moving, nor `SEEK_QUIET` seconds after a decoder seeked: a
+/// seek or a decoder warming up after one is not a resolution problem), at most one step every
+/// `LOWER_COOLDOWN` seconds (each step restarts the decoders at the new size).
 const DROP_RATIO: f64 = 0.12;
 const DROP_WINDOW: f64 = 1.5;
 const SETTLE: f64 = 0.75;
+const SEEK_QUIET: f64 = 2.5;
+const LOWER_COOLDOWN: f64 = 4.0;
 /// ...and raises it again after this many seconds of playback without a dropped frame, if
 /// rendering used less than `RAISE_LOAD` of the time it had.
 const RAISE_AFTER: f64 = 15.0;
@@ -343,6 +348,11 @@ pub struct Engine {
     pool: Arc<aiframes_media::MediaPool>,
     /// Since when playback has run without dropping a frame.
     smooth_since: Option<f64>,
+    /// Since when every drop window has been over `DROP_RATIO`.
+    bad_since: Option<f64>,
+    /// The pool's seek count and when it last changed; when Auto last lowered the scale.
+    last_seeks: (u64, f64),
+    last_lowered: f64,
     /// (wall, dropped) over the last second of playback (the dropped-frame indicator).
     recent_drops: VecDeque<(f64, u64)>,
     play_started: f64,
@@ -449,6 +459,9 @@ impl Engine {
             drops: VecDeque::new(),
             pool: pool_for_quality,
             smooth_since: None,
+            bad_since: None,
+            last_seeks: (0, f64::NEG_INFINITY),
+            last_lowered: f64::NEG_INFINITY,
             recent_drops: VecDeque::new(),
             play_started: 0.0,
             stats: Stats { audio: audio_on, ..Default::default() },
@@ -527,6 +540,7 @@ impl Engine {
         self.auto_cap = 1.0;
         self.drops.clear();
         self.smooth_since = None;
+        self.bad_since = None;
     }
 
     /// Auto quality while playing: one step down after sustained drops, one up after a long
@@ -539,11 +553,15 @@ impl Engine {
             // The settling time counts from when the picture starts moving.
             self.play_started = wall;
         }
+        let seeks = self.pool.stats().seeks;
+        if seeks != self.last_seeks.0 {
+            self.last_seeks = (seeks, wall);
+        }
         if !self.adaptive || !self.clock.playing() || pending || wall - self.play_started < SETTLE {
             self.drops.clear();
+            self.bad_since = None;
             return;
         }
-        let seeks = self.pool.stats().seeks;
         self.drops.push_back((wall, self.stats.dropped, seeks));
         while self.drops.front().is_some_and(|(w, _, _)| wall - w > DROP_WINDOW) {
             self.drops.pop_front();
@@ -561,15 +579,18 @@ impl Engine {
         } else if self.smooth_since.is_none() {
             self.smooth_since = Some(wall);
         }
-        if wall - w0 >= DROP_WINDOW * 0.9 && seeks == s0 {
-            let expected = (wall - w0) * fps / step;
-            if dropped as f64 > expected * DROP_RATIO {
-                if let Some(lower) = SCALE_STEPS.iter().rev().copied().find(|s| *s < scale - 1e-3) {
-                    self.auto_cap = lower;
-                    self.set_scale(self.target_scale.min(lower));
-                    self.drops.clear();
-                    return;
-                }
+        let quiet = seeks == s0 && wall - self.last_seeks.1 > SEEK_QUIET && wall - self.last_lowered > LOWER_COOLDOWN;
+        let bad = wall - w0 >= DROP_WINDOW * 0.9 && dropped as f64 > (wall - w0) * fps / step * DROP_RATIO;
+        if !(quiet && bad) {
+            self.bad_since = None;
+        } else if wall - *self.bad_since.get_or_insert(wall) >= DROP_WINDOW {
+            if let Some(lower) = SCALE_STEPS.iter().rev().copied().find(|s| *s < scale - 1e-3) {
+                self.auto_cap = lower;
+                self.set_scale(self.target_scale.min(lower));
+                self.drops.clear();
+                self.bad_since = None;
+                self.last_lowered = wall;
+                return;
             }
         }
         // Rendering a frame took this share of the time there was for it (all workers together).
@@ -864,7 +885,8 @@ impl Engine {
             st.clock_frame = f;
             if playing {
                 let dir = st.step.signum();
-                if let Some(i) = schedule::pick(&st.frames, f, dir) {
+                let show = schedule::paced_frame(t, fps, self.last_played, st.step);
+                if let Some(i) = schedule::pick(&st.frames, show, dir) {
                     let newer = match self.displayed {
                         Some((g, d, false)) if g == st.gen && self.displayed_run == self.run => (i - d) * dir > 0,
                         _ => true,
