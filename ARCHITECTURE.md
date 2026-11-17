@@ -226,6 +226,14 @@ The same `frame` function serves preview (scaled), snapshots and export, so what
   and the module files, and `media/src/lib.rs`. Track ids are `v1`/`a1`, media `m1`, markers `mk1`, clips `c1`, transitions `tr1`.
   `Document` has `undo_by(author)`/`redo_by(author)`, `refresh()`, `validate()` (adds `media_offline`), `describe()`.
   `core::OPS` lists every op with help and a JSON example; `Op::from_json` gives near-miss suggestions.
+- **Effect previews** (`mcp/src/fx_preview.rs`, shared): an edit applied to a *scratch copy* of the project
+  and drawn by the one renderer, plus a painted two-still sample scene (written once to the media cache) for
+  when no picture clip is selected. Users: the effects browser's thumbnails (`app/src/fx_previews.rs`: one
+  background thread in its own lowest-priority rayon pool, debounced on revision/selection/playhead, frozen
+  while playing or scrubbing, pausing between thumbnails during playback), the browser's live hover preview
+  (`effects_browser::preview_plan` = the ops a click would make, shown through `UiAction::Preview`; the
+  playhead moves to the cut or into the clip and back), and the AI's `preview_effects` tool. Nothing of it
+  ever reaches a document or its history.
 - `render/src/lib.rs`, `ui/src/lib.rs` and `mcp/src/lib.rs` are **orchestrator stubs whose public signatures are the contract**
   (types: `Image`, `FrameOptions`, `Renderer`, `export`, `contact_sheet`; `EditCtx`, `UiAction`, `MediaPreview`, `MediaDrag`, widget
   structs; `Services`, `Hub`, `ProjectDoc`, `LiveState`, `Jobs`, `actions::*`, `start_http`, `run_stdio`, `cli`). Keep them; add freely.
@@ -249,7 +257,7 @@ Tools (all JSON in/out, every edit returns the receipt; `author` = "ai" unless g
 `list_projects`, `new_project`, `open_project`, `save_project`, `close_project`, `describe_project` (text timeline + notes + open findings),
 `get_timeline` (JSON), `get_clip`, `import_media` (probe + add, folder import, optional transcribe), `list_media`, `edit` (batch of ops, `plan: true` = dry run, `base_revision` = refuse it if the person's newer changes affect it),
 `undo`, `redo`, `history` / `changes_since`, `validate`, `snapshot` (PNG frames at times — returned as images), `contact_sheet`, `filmstrip` (frames around a cut),
-`list_effects` / `list_transitions` / `list_ops` (schemas with defaults), `transcribe`, `get_transcript` / `search_transcript` (word indices + timeline times),
+`list_effects` / `list_transitions` / `list_ops` (schemas with defaults), `preview_effects` (a clip with each effect/transition added, on scratch copies), `transcribe`, `get_transcript` / `search_transcript` (word indices + timeline times),
 `delete_words`, `generate_captions`, `detect_scenes`, `detect_silence` + `remove_silences` (plan/apply), `detect_beats` (+ markers), `analyze_audio` (loudness over time,
 peaks, per-track levels), `export` (background job with progress; `export_status`), `chapters` (YouTube chapter text from chapter markers),
 `play` / `seek` / `select` / `screenshot_ui` (live GUI only), `launch_gui` (headless).

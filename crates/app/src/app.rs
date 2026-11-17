@@ -5,6 +5,7 @@ use crate::ai::{AiPanel, LogKind, RunContext};
 use crate::dialogs::{self, AfterSave, DialogCx, DialogOut, Dialogs, Modal};
 use crate::edits;
 use crate::export::{ExportCx, ExportDialog, ExportRequest};
+use crate::fx_previews::{FxPreviews, HoverCtl};
 use crate::panels::{self, Cmd, MenuInfo, PanelId, SideTab, StatusInfo, Toast, ToastKind};
 use crate::playback::{clock::Shuttle, Engine, Quality, Snapshot};
 use crate::prefs::{self, Prefs};
@@ -180,6 +181,9 @@ pub struct AiFramesApp {
     layers: ((u64, u64, u64), i64, Vec<LayerBox>),
     live_preview: Option<LivePreview>,
     preview_epoch: u64,
+    /// (added) Effects browser thumbnails and its live hover preview in the viewer.
+    fx: FxPreviews,
+    fx_hover: HoverCtl,
     /// The latest `UiAction::Preview` of this frame (last wins).
     frame_preview: Option<Vec<Op>>,
     /// The ops preview the viewer shows (see [`App::finish_ops_preview`]).
@@ -251,6 +255,7 @@ impl AiFramesApp {
         }
         let previews = Previews::new(ctx.clone(), services.pool.clone());
         let exe = std::env::current_exe().map(|p| p.display().to_string().trim_start_matches(r"\\?\").to_string()).unwrap_or_else(|_| "aiframes.exe".into());
+        let fx = FxPreviews::new(ctx.clone(), services.renderer.clone());
         let mut viewer = Viewer::default();
         viewer.quality = Quality::from_id(&prefs.quality);
         viewer.safe = prefs.layout.safe_guides;
@@ -285,6 +290,8 @@ impl AiFramesApp {
             layers: ((u64::MAX, 0, 0), 0, Vec::new()),
             live_preview: None,
             preview_epoch: 0,
+            fx,
+            fx_hover: HoverCtl::default(),
             frame_preview: None,
             ops_preview: None,
             jobs_seen: HashSet::new(),
@@ -2184,6 +2191,9 @@ impl AiFramesApp {
             engine_mb,
             history
         );
+        // (added) Effect thumbnails: rendered so far, average ms each, queued, failed.
+        let (fx_n, fx_ms, fx_q, fx_fail) = self.fx.stats();
+        let line = line.replacen('{', &format!("{{\"fx_thumbs\":{fx_n},\"fx_ms\":{fx_ms:.1},\"fx_queue\":{fx_q},\"fx_failed\":{fx_fail},"), 1);
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             let _ = f.write_all(line.as_bytes());
@@ -2330,6 +2340,13 @@ impl eframe::App for AiFramesApp {
             if let Some(d) = self.docs.get_mut(id) {
                 d.playhead = playhead;
             }
+            // (added) Effect thumbnails follow the document, selection and playhead (when shown).
+            if self.side_tab == SideTab::Effects && self.prefs.layout.show_side {
+                if let Some((snap, sel)) = self.docs.get(id).and_then(|d| Some((d.snap.clone()?, d.selection.clone()))) {
+                    let scrubbing = ctx.input(|i| i.pointer.primary_down()) || self.viewer.dragging();
+                    self.fx.set_base(&snap, &sel, playhead, self.engine.playing(), scrubbing, self.fx_hover.holds_playhead(), self.now);
+                }
+            }
         }
 
         let mut actions: Vec<UiAction> = Vec::new();
@@ -2337,6 +2354,8 @@ impl eframe::App for AiFramesApp {
         let mut commands: Vec<Command> = Vec::new();
         let mut ai_run = false;
         let mut ai_reveal: Option<Id> = None;
+        let mut fx_clicked = false;
+        let mut fx_preview_ops: Option<Vec<Op>> = None;
         if active.is_some() && self.frames > 10 {
             if let Some(p) = self.knobs.ai_prompt.take() {
                 self.ai.prompt = p;
@@ -2552,7 +2571,9 @@ impl eframe::App for AiFramesApp {
                             SideTab::Effects => {
                                 // The selected clip's effect controls, docked under the browser.
                                 actions.extend(w.inspector.effect_controls(ui, &cx));
-                                actions.extend(w.effects.ui(ui, &cx));
+                                let a = w.effects.ui_with(ui, &cx, &self.fx);
+                                fx_clicked = !a.is_empty();
+                                actions.extend(a);
                             }
                             SideTab::Transcript => actions.extend(w.transcript.ui(ui, &cx)),
                             SideTab::History => actions.extend(w.history.ui(ui, &cx)),
@@ -2601,6 +2622,7 @@ impl eframe::App for AiFramesApp {
                     volume,
                     muted,
                 };
+                let fx_hovered = if self.side_tab == SideTab::Effects && layout.show_side { w.effects.hovered.clone() } else { None };
                 let mut vout = Default::default();
                 let r = egui::CentralPanel::default().frame(egui::Frame::NONE.fill(pal.bg_app).inner_margin(egui::Margin::same(4))).show(ui, |ui| {
                     vout = self.viewer.ui(ui, &vcx);
@@ -2653,6 +2675,18 @@ impl eframe::App for AiFramesApp {
                     }
                     _ => {}
                 }
+                // (added) Live preview of the hovered effects-browser item (never applied; a click is).
+                if self.live_preview.is_none() {
+                    if let Some((snap, sel)) = self.docs.get(&id).and_then(|d| Some((d.snap.clone()?, d.selection.clone()))) {
+                        let hovered = fx_hovered.filter(|_| !egui::Popup::is_any_open(&ctx));
+                        if let Some(ops) = self.fx_hover.step(&ctx, &mut self.engine, &snap, &sel, hovered, fx_clicked, self.now) {
+                            fx_preview_ops = Some(ops);
+                        }
+                    }
+                    if let Some(note) = &self.fx_hover.note {
+                        crate::fx_previews::draw_note(&ctx, self.viewer_rect, note, self.fx_hover.previewing);
+                    }
+                }
             }
         }
         if active.is_none() {
@@ -2678,6 +2712,10 @@ impl eframe::App for AiFramesApp {
         }
         cmds.extend(self.clipboard_events(&ctx));
 
+        // (added) The hovered effects-browser item, shown in the viewer without editing.
+        if let Some(ops) = fx_preview_ops {
+            actions.push(UiAction::Preview(ops));
+        }
         // Process.
         if let Some(id) = active_id {
             for a in actions {

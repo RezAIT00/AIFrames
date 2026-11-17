@@ -260,6 +260,24 @@ pub fn definitions(include_launch: bool) -> Vec<J> {
             Write,
         ),
         tool(
+            "preview_effects",
+            "Preview effects",
+            "See what effects and transitions would look like before applying any: one labelled grid with the clip as it is (\"Original\") and a copy with each effect (default settings) or transition added — nothing is changed and nothing enters the history (the same renders as the effects browser's thumbnails). Effects show on `clip` (default: the person's selected picture clip) at `at` (default: the playhead, moved into the clip); transitions on that clip's cut, 35 % of the way through. Without a clip, a sample picture is used. Default: every effect and transition.",
+            json!({
+                "clip": s("Picture clip to preview on (default: the selected picture clip; none = a sample picture)."),
+                "at": n("Timeline seconds for effects (default: the playhead, clamped into the clip)."),
+                "effects": {"type": ["array", "string", "boolean"], "items": {"type": "string"}, "description": "Effect kinds (list_effects) or \"all\"; false = none. Default: all (when transitions is not given either)."},
+                "transitions": {"type": ["array", "string", "boolean"], "items": {"type": "string"}, "description": "Transition kinds (list_transitions) or \"all\"; false = none. Default: all (when effects is not given either)."},
+                "original": b("Include the clip as it is, first (default true)."),
+                "width": i("Width of each tile px, 64–640 (default 240)."),
+                "cols": i("Tiles per row, 1–12 (default 6)."),
+                "save_path": s("Also write the PNG here (relative = the project's folder; never over project files or media)."),
+                "image": b("Return the image (default true)."),
+            }),
+            &[],
+            Write,
+        ),
+        tool(
             "filmstrip",
             "Filmstrip",
             "A row of frames just before and after a cut (or around a time) to judge the edit point, continuity and transitions. Names the outgoing/incoming clips and any transition. With asset/file: frames around `at` (source seconds) of that media, e.g. to find the exact frame a moment happens.",
@@ -551,7 +569,7 @@ pub fn instructions(mode: &str) -> String {
 
 Work loop
 1. Look: list_projects / describe_project (the whole edit as text: video tracks from the top layer down to V1, then audio tracks with A1 first — the order the timeline shows them; clips as [start–end] timeline seconds with id, source, anchor, effects, notes; open problems). get_clip / get_timeline for details; get_state for what the person is looking at (their selection is what "this clip" means).
-2. Edit: edit {{ops:[...]}} — one array = one atomic, undoable step. Use plan:true first for anything large (same receipt and findings, nothing changes). list_ops shows every op with an example (and the clip parameter ranges); list_effects / list_transitions the registries. move_clips moves several clips at once (swap two shots, move a group to another track) without intermediate overlaps.
+2. Edit: edit {{ops:[...]}} — one array = one atomic, undoable step. Use plan:true first for anything large (same receipt and findings, nothing changes). list_ops shows every op with an example (and the clip parameter ranges); list_effects / list_transitions the registries; preview_effects shows a clip with each effect or transition added (nothing applied) to choose a look. move_clips moves several clips at once (swap two shots, move a group to another track) without intermediate overlaps.
 3. Check: read the receipt (moved, warnings, new_findings, open_errors) and run validate (each finding has a fix and often fix_ops; apply_fixes:true applies them). After tightening, speeding up or trimming, re-check the brief's constraints (total length range, moments that must land on a word or screen, e.g. a fast-forward ending on the win screen) with describe_project and a snapshot — tightening silently moves them.
 4. See: snapshot (frames → image; what is on screen; warnings when media is offline), contact_sheet (the whole edit at a glance), filmstrip (frames around a cut). Look after every few edits.
 5. Deliver: save_project when asked, export (background job → export_status; presets 1080p/4k/shorts/square set the output size, or set_export_size in the project), chapters for the YouTube description, analyze_audio for levels (auto_ducking puts music under the voice).

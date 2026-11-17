@@ -70,6 +70,7 @@ impl suite_mcp::Backend for AiframesBackend {
             "contact_sheet",
             "filmstrip",
             "snapshot",
+            "preview_effects",
             "import_transcript",
             "align_transcript",
             "generate_captions",

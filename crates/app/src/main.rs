@@ -14,6 +14,7 @@ mod edits;
 mod export;
 mod external;
 mod follow;
+mod fx_previews;
 mod panels;
 mod playback;
 mod prefs;
