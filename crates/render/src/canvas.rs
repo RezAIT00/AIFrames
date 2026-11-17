@@ -638,6 +638,213 @@ pub(crate) fn draw_raster_over(dst: &mut Layer, d: &RasterDraw, bg: Px) {
     }
 }
 
+/// `v as f32 / 255` the way `fetch` computes it.
+static U8_F32: [f32; 256] = {
+    let mut t = [0f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = i as f32 * (1.0 / 255.0);
+        i += 1;
+    }
+    t
+};
+
+/// `draw_raster_over` onto a fresh `cw`×`ch` canvas followed by `Layer::to_rgba8`, for a draw
+/// without rotation or skew: the same sampling, edge coverage and blending, written straight to
+/// RGBA8 (no f32 canvas), with each column's and row's sample position worked out once. The
+/// result is the same bytes. `None` for rotated, skewed or projective draws.
+///
+/// This is the whole frame of the most common case (one plain video clip), so it is what playback
+/// spends most of its compositing time on.
+pub(crate) fn raster_over_rgba8(d: &RasterDraw, bg: Px, cw: u32, ch: u32) -> Option<Vec<u8>> {
+    let inv = d.inv.to_affine()?;
+    if inv.b != 0.0 || inv.c != 0.0 {
+        return None;
+    }
+    let (w, h) = (cw as usize, ch as usize);
+    let bg8 = unpremul8(bg);
+    let mut out = vec![0u8; w * h * 4];
+    let fill_all = |out: &mut Vec<u8>| {
+        out.par_chunks_mut((w * 4).max(4)).for_each(|row| {
+            for px in row.as_chunks_mut::<4>().0 {
+                *px = bg8;
+            }
+        })
+    };
+    let pic = d.pic;
+    let dst_rect = IRect::of_size(cw, ch);
+    if pic.w == 0 || pic.h == 0 || d.opacity <= 0.0 || dst_rect.is_empty() {
+        fill_all(&mut out);
+        return Some(out);
+    }
+    let mut src = d.src;
+    src[0] = src[0].max(0.0);
+    src[1] = src[1].max(0.0);
+    src[2] = src[2].min(pic.w as f64);
+    src[3] = src[3].min(pic.h as f64);
+    if src[2] <= src[0] || src[3] <= src[1] {
+        fill_all(&mut out);
+        return Some(out);
+    }
+    let region = d.bounds().intersect(&dst_rect);
+    if region.is_empty() {
+        fill_all(&mut out);
+        return Some(out);
+    }
+    let data: &[u8] = &pic.data;
+    let premul = pic.premul;
+    let opacity = d.opacity;
+    let pw = pic.w as usize;
+    // Rows of about 64k pixels per task: the work per row is small, and every extra task wakes
+    // (and spins) another pool thread.
+    let min_rows = (65536 / w.max(1)).max(1);
+    let px_over = |s: Px| -> [u8; 4] {
+        let k = 1.0 - s[3];
+        unpremul8([s[0] + bg[0] * k, s[1] + bg[1] * k, s[2] + bg[2] * k, s[3] + bg[3] * k])
+    };
+
+    // Whole-pixel copy (same resolution, pixel-aligned crop), as in `draw_raster_impl`.
+    let aligned = src.iter().all(|v| (v - v.round()).abs() < 1e-6);
+    if let (Some((dx, dy)), true) = (inv.integer_translation(), aligned) {
+        let (sx0, sy0, sx1, sy1) = (src[0] as i64, src[1] as i64, src[2] as i64, src[3] as i64);
+        let xa = (sx0 - dx).max(region.x as i64);
+        let xb = (sx1 - dx).min(region.right() as i64).max(xa);
+        out.par_chunks_mut(w * 4).with_min_len(min_rows).enumerate().for_each(|(y, line)| {
+            let y = y as i64;
+            let sy = y + dy;
+            for px in line.as_chunks_mut::<4>().0 {
+                *px = bg8;
+            }
+            if y < region.y as i64 || y >= region.bottom() as i64 || sy < sy0 || sy >= sy1 {
+                return;
+            }
+            let row = sy as usize * pw * 4;
+            for x in xa..xb {
+                let sx = (x + dx) as usize;
+                let o = &mut line[x as usize * 4..x as usize * 4 + 4];
+                let p = &data[row + sx * 4..row + sx * 4 + 4];
+                if !premul && p[3] == 255 && opacity >= 1.0 {
+                    // An opaque pixel over anything: itself (what the f32 path rounds back to).
+                    o.copy_from_slice(p);
+                    continue;
+                }
+                let mut s = fetch(data, pw, sx, sy as usize, premul);
+                if opacity < 1.0 {
+                    for v in s.iter_mut() {
+                        *v *= opacity;
+                    }
+                }
+                o.copy_from_slice(&px_over(s));
+            }
+        });
+        return Some(out);
+    }
+
+    let gx = (inv.a * inv.a + inv.c * inv.c).sqrt().max(1e-9);
+    let gy = (inv.b * inv.b + inv.d * inv.d).sqrt().max(1e-9);
+    let tx0 = src[0].floor() as i64;
+    let ty0 = src[1].floor() as i64;
+    let tx1 = (src[2].ceil() as i64 - 1).min(pw as i64 - 1);
+    let ty1 = (src[3].ceil() as i64 - 1).min(pic.h as i64 - 1);
+    // Columns: the same span for every row (no skew), then per-column sample position and coverage.
+    let (a0, a1) = span_1d(inv.a, inv.e, src[0] - 0.5 * gx, src[2] + 0.5 * gx);
+    struct Col {
+        cx: f64,
+        nx: usize,
+        x0: usize,
+        x1: usize,
+        tw: f32,
+    }
+    let cols: Vec<Col> = (0..w)
+        .map(|x| {
+            let ox = x as f64 + 0.5;
+            let sx = inv.a * ox + inv.c * 0.0 + inv.e;
+            let cx = (((sx - src[0]).min(src[2] - sx)) / gx + 0.5).clamp(0.0, 1.0);
+            let fx = sx - 0.5;
+            let ixf = fx.floor();
+            let ix = ixf as i64;
+            Col {
+                cx,
+                nx: (sx.floor() as i64).clamp(tx0, tx1) as usize,
+                x0: ix.clamp(tx0, tx1) as usize,
+                x1: (ix + 1).clamp(tx0, tx1) as usize,
+                tw: (fx - ixf) as f32,
+            }
+        })
+        .collect();
+    out.par_chunks_mut(w * 4).with_min_len(min_rows).enumerate().for_each(|(y, line)| {
+        for px in line.as_chunks_mut::<4>().0 {
+            *px = bg8;
+        }
+        let y = y as i32;
+        if y < region.y || y >= region.bottom() {
+            return;
+        }
+        let oy = y as f64 + 0.5;
+        // As `draw_raster_impl` (with b = c = 0 the column span does not depend on the row).
+        let (b0, b1) = span_1d(inv.b, inv.d * oy + inv.f, src[1] - 0.5 * gy, src[3] + 0.5 * gy);
+        let lo = a0.max(b0);
+        let hi = a1.min(b1);
+        if !(lo < hi) {
+            return;
+        }
+        let xa = ((lo - 0.5).floor() as i64).max(region.x as i64);
+        let xb = ((hi - 0.5).ceil() as i64 + 1).min(region.right() as i64).max(xa);
+        let sy = inv.b * 0.0 + inv.d * oy + inv.f;
+        let cy = (((sy - src[1]).min(src[3] - sy)) / gy + 0.5).clamp(0.0, 1.0);
+        let fy = sy - 0.5;
+        let iyf = fy.floor();
+        let tyw = (fy - iyf) as f32;
+        let iy = iyf as i64;
+        let y0 = iy.clamp(ty0, ty1) as usize;
+        let y1 = (iy + 1).clamp(ty0, ty1) as usize;
+        let ny = (sy.floor() as i64).clamp(ty0, ty1) as usize;
+        let (r0, r1) = (&data[y0 * pw * 4..(y0 + 1) * pw * 4], &data[y1 * pw * 4..(y1 + 1) * pw * 4]);
+        for x in xa..xb {
+            let c = &cols[x as usize];
+            let cov = (c.cx * cy) as f32;
+            if cov <= 0.0 {
+                continue;
+            }
+            let (i0, i1) = (c.x0 * 4, c.x1 * 4);
+            if !d.nearest && cov == 1.0 && opacity == 1.0 && r0[i0 + 3] == 255 && r0[i1 + 3] == 255 && r1[i0 + 3] == 255 && r1[i1 + 3] == 255 {
+                // Four opaque taps, fully covered: every premultiply, the blend over the
+                // background and the unpremultiply are exact no-ops, leaving a plain lerp.
+                let o = &mut line[x as usize * 4..x as usize * 4 + 4];
+                for k in 0..3 {
+                    let (p00, p10, p01, p11) = (U8_F32[r0[i0 + k] as usize], U8_F32[r0[i1 + k] as usize], U8_F32[r1[i0 + k] as usize], U8_F32[r1[i1 + k] as usize]);
+                    let a = p00 + (p10 - p00) * c.tw;
+                    let b = p01 + (p11 - p01) * c.tw;
+                    let v = a + (b - a) * tyw;
+                    o[k] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                }
+                o[3] = 255;
+                continue;
+            }
+            let s = if d.nearest {
+                fetch(data, pw, c.nx, ny, premul)
+            } else {
+                let p00 = fetch(data, pw, c.x0, y0, premul);
+                let p10 = fetch(data, pw, c.x1, y0, premul);
+                let p01 = fetch(data, pw, c.x0, y1, premul);
+                let p11 = fetch(data, pw, c.x1, y1, premul);
+                let mut o = [0f32; 4];
+                for k in 0..4 {
+                    let a = p00[k] + (p10[k] - p00[k]) * c.tw;
+                    let b = p01[k] + (p11[k] - p01[k]) * c.tw;
+                    o[k] = a + (b - a) * tyw;
+                }
+                o
+            };
+            let k = cov * opacity;
+            let s = [s[0] * k, s[1] * k, s[2] * k, s[3] * k];
+            let i = x as usize * 4;
+            line[i..i + 4].copy_from_slice(&px_over(s));
+        }
+    });
+    Some(out)
+}
+
 #[inline]
 fn put(o: &mut Px, s: Px, mode: BlendMode, fill: Option<Px>) {
     match fill {
@@ -1155,6 +1362,57 @@ pub(crate) mod tests {
 
     fn pic(w: u32, h: u32, c: [u8; 4]) -> Picture {
         Picture { w, h, data: Arc::new(c.iter().copied().cycle().take((w * h * 4) as usize).collect()), premul: false }
+    }
+
+    /// A noisy picture; `alpha`: some pixels translucent (else all opaque).
+    fn noise_pic(w: u32, h: u32, seed: u64, alpha: bool, premul: bool) -> Picture {
+        let mut s = seed | 1;
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..w * h {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let a = if alpha { [255u8, 255, 128, 0, 30][(s % 5) as usize] } else { 255 };
+            for k in 0..3 {
+                let c = ((s >> (8 * (k + 1))) & 0xff) as u8;
+                v.push(if premul { (c as u32 * a as u32 / 255) as u8 } else { c });
+            }
+            v.push(a);
+        }
+        Picture { w, h, data: Arc::new(v), premul }
+    }
+
+    #[test]
+    fn straight_rgba8_fast_path_matches_the_canvas_path() {
+        // Every axis-aligned case the compositor meets: same size (whole-pixel copy), down- and
+        // upscaling, fractional offsets (soft edges), crops, fades, drafts (nearest), translucent
+        // and premultiplied pictures, letterbox bars and transparent backgrounds.
+        let (cw, ch) = (97u32, 61u32);
+        let mut cases = 0;
+        for (pi, p) in [noise_pic(97, 61, 1, false, false), noise_pic(64, 40, 2, false, false), noise_pic(200, 120, 3, true, false), noise_pic(50, 50, 4, true, true)].iter().enumerate() {
+            for &(sx, sy, ex, ey) in &[(1.0, 1.0, 0.0, 0.0), (1.0, 1.0, 3.0, -2.0), (0.5, 0.5, 0.25, 0.75), (2.0, 2.0, -7.3, 1.1), (1.37, 0.91, 5.5, -3.25), (0.333, 0.333, 0.0, 0.0), (1.0, 1.0, 0.4, 0.0)] {
+                for src in [[0.0, 0.0, p.w as f64, p.h as f64], [3.0, 2.0, p.w as f64 - 5.0, p.h as f64 - 1.0], [1.5, 0.25, p.w as f64 * 0.8, p.h as f64 * 0.7]] {
+                    for &(opacity, nearest) in &[(1.0f32, false), (0.6, false), (1.0, true)] {
+                        for bg in [[0.1f32, 0.2, 0.3, 1.0], [0.0, 0.0, 0.0, 0.0]] {
+                            let inv = Proj::from_affine(&Affine { a: sx, b: 0.0, c: 0.0, d: sy, e: ex, f: ey });
+                            let d = RasterDraw { pic: p, inv, src, opacity, nearest };
+                            let mut l = Layer::dirty(cw, ch);
+                            draw_raster_over(&mut l, &d, bg);
+                            let want = l.to_rgba8();
+                            let got = raster_over_rgba8(&d, bg, cw, ch).expect("axis-aligned");
+                            let diff = want.iter().zip(&got).position(|(a, b)| a != b);
+                            assert!(diff.is_none(), "picture {pi}, inv ({sx},{sy},{ex},{ey}), src {src:?}, opacity {opacity}, nearest {nearest}, bg {bg:?}: first difference at byte {diff:?}");
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 400);
+        // Rotated or projective draws are left to the general path.
+        let p = noise_pic(10, 10, 5, false, false);
+        let d = RasterDraw { pic: &p, inv: Proj::from_affine(&Affine { a: 0.9, b: 0.1, c: -0.1, d: 0.9, e: 0.0, f: 0.0 }), src: [0.0, 0.0, 10.0, 10.0], opacity: 1.0, nearest: false };
+        assert!(raster_over_rgba8(&d, [0.0; 4], 16, 16).is_none());
     }
 
     #[test]
