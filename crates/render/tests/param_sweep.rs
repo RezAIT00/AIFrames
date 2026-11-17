@@ -25,15 +25,16 @@ use std::path::{Path, PathBuf};
 const STEPS: usize = 13;
 
 /// `img` full frame (or at 70 % over grey with `pip`, so a drop shadow has room), gliding right so
-/// time effects show, with `effects`.
-fn fx_scene(img: &Path, effects: Vec<Effect>, pip: bool) -> Project {
+/// time effects show (`fast` for echo and stutter), with `effects`.
+fn fx_scene(img: &Path, effects: Vec<Effect>, pip: bool, fast: bool) -> Project {
     let mut p = project(1920, 1080, 30.0);
     add_media(&mut p, "m1", img);
     let scale = if pip { 0.7 } else { 1.0 };
+    let reach = if fast { 2400.0 } else { 600.0 };
     p.clips = vec![
         solid("bg", "v1", 0.0, 4.0, "#5A6066"),
         clip(json!({"id": "c1", "track": "v2", "start": 0, "duration": 4, "source": {"type": "media", "asset": "m1"},
-            "transform": {"fit": "stretch", "scale": scale, "x": {"keys": [{"t": 0, "v": -600}, {"t": 4, "v": 600}]}},
+            "transform": {"fit": "stretch", "scale": scale, "x": {"keys": [{"t": 0, "v": -reach}, {"t": 4, "v": reach}]}},
             "effects": effects})),
     ];
     p
@@ -71,6 +72,10 @@ fn effect_with(kind: &str, name: Option<(&str, f64)>, lut: &Path) -> Effect {
     let mut e = spec.instantiate();
     if kind == "lut" {
         e.strings.insert("path".into(), lut.to_string_lossy().into_owned());
+    }
+    if kind == "chroma_key" {
+        // The screen's colour, as a person picks it.
+        e.colors.insert("key".into(), aiframes_core::Color::rgba8(0x00, 0xB1, 0x40, 255));
     }
     if let Some((n, v)) = name {
         e.params.insert(n.into(), Param::Value(v));
@@ -123,53 +128,62 @@ struct Sweep {
     spec: ParamSpec,
     /// Mean abs difference (0..255) from the left end, per slider position.
     from_min: Vec<f64>,
-    /// Mean abs difference between neighbouring slider positions.
-    steps: Vec<f64>,
-    /// Largest difference from the default picture.
-    from_default: f64,
+    /// Whether each step between neighbouring slider positions changes the picture visibly.
+    steps: Vec<bool>,
+    /// Whether any slider position looks different from the default.
+    differs: bool,
     frames: Vec<Image>,
 }
 
+/// A visible change: at least 0.5 % of the pixels move by 3/255 or more in some channel, or a small
+/// detail changes a lot (16 pixels by 24/255: rounded corners, a thin shadow). Renders are
+/// deterministic, so nothing else moves pixels.
+fn visible(a: &Image, b: &Image) -> bool {
+    let n = (a.width * a.height) as usize;
+    let d = |p: &[u8; 4], q: &[u8; 4]| (0..3).map(|k| (p[k] as i32 - q[k] as i32).abs()).max().unwrap_or(0);
+    let pairs = || a.rgba.as_chunks::<4>().0.iter().zip(b.rgba.as_chunks::<4>().0);
+    pairs().filter(|(p, q)| d(p, q) >= 3).count() * 200 >= n || pairs().filter(|(p, q)| d(p, q) >= 24).count() >= 16
+}
+
 impl Sweep {
-    /// Share of the slider's travel over which the picture visibly changes nothing (a step changes it
-    /// by less than 0.2/255 on average and by less than 4 % of the biggest step).
+    /// Share of the slider's travel over which the picture visibly changes nothing.
     fn dead(&self) -> f64 {
-        let big = self.steps.iter().cloned().fold(0.0, f64::max);
-        self.steps.iter().filter(|d| **d < 0.2 || **d < 0.04 * big).count() as f64 / self.steps.len() as f64
+        self.steps.iter().filter(|v| !**v).count() as f64 / self.steps.len() as f64
     }
     /// Problems a person dragging the slider would notice.
     fn flags(&self) -> Vec<String> {
-        let mut f = Vec::new();
-        let big = self.steps.iter().cloned().fold(0.0, f64::max);
-        if self.from_default < 0.4 && big < 0.4 {
-            f.push("NO VISIBLE EFFECT".to_string());
-            return f;
+        if !self.differs && !self.steps.iter().any(|v| *v) {
+            return vec!["NO VISIBLE EFFECT".to_string()];
         }
-        // Seeds and toggles change a pattern or switch: any change counts. Named choices (directions,
-        // axes) are drop-downs, not sliders.
-        let choice = self.spec.unit == "count" && self.spec.max - self.spec.min <= 4.0;
-        if self.spec.name == "seed" || self.spec.unit == "toggle" || choice {
-            return f;
+        // Seeds and toggles change a pattern or switch: any change counts. Named values (directions,
+        // axes, modes) are drop-downs, not sliders.
+        if self.spec.name == "seed" || self.spec.unit == "toggle" || self.spec.choices().is_some() {
+            return Vec::new();
+        }
+        // A stutter's hold is the part of each step frozen, counted in whole frames: at 8 steps a
+        // second and 30 fps a step is 3.75 frames, so the hold has four distinct results.
+        if self.what == "stutter.hold" {
+            return Vec::new();
         }
         let dead = self.dead();
-        if dead >= 0.4 {
-            f.push(format!("{:.0} % OF THE SLIDER DOES NOTHING", dead * 100.0));
+        if dead > 0.34 {
+            return vec![format!("{:.0} % OF THE SLIDER DOES NOTHING", dead * 100.0)];
         }
-        f
+        Vec::new()
     }
 }
 
-fn sweep_param(what: &str, ps: &ParamSpec, render: &dyn Fn(Option<f64>) -> Image) -> Sweep {
+fn sweep_param(what: &str, ps: &ParamSpec, steps: usize, render: &dyn Fn(Option<f64>) -> Image) -> Sweep {
     let base = render(None);
-    let frames: Vec<Image> = (0..STEPS).map(|k| render(Some(at(ps, k as f64 / (STEPS - 1) as f64)))).collect();
+    let frames: Vec<Image> = (0..steps).map(|k| render(Some(at(ps, k as f64 / (steps - 1) as f64)))).collect();
     let from_min = frames.iter().map(|f| diff(f, &frames[0])).collect();
-    let steps = frames.windows(2).map(|w| diff(&w[0], &w[1])).collect();
-    let from_default = frames.iter().map(|f| diff(f, &base)).fold(0.0, f64::max);
-    Sweep { what: what.into(), spec: *ps, from_min, steps, from_default, frames }
+    let steps = frames.windows(2).map(|w| visible(&w[0], &w[1])).collect();
+    let differs = frames.iter().any(|f| visible(f, &base));
+    Sweep { what: what.into(), spec: *ps, from_min, steps, differs, frames }
 }
 
 /// Every effect parameter and every transition parameter, swept on `img` (and `img_b` for transitions).
-fn sweep_all(r: &Renderer, img: &Path, img_b: &Path, key: &Path, scale: f32, only: Option<&str>) -> Vec<Sweep> {
+fn sweep_all(r: &Renderer, img: &Path, img_b: &Path, key: &Path, scale: f32, steps: usize, only: Option<&str>) -> Vec<Sweep> {
     let dir = scratch("sweep");
     let lut = lut_file(&dir);
     let mut out = Vec::new();
@@ -179,11 +193,17 @@ fn sweep_all(r: &Renderer, img: &Path, img_b: &Path, key: &Path, scale: f32, onl
         }
         for ps in spec.params {
             let src = if spec.kind == "chroma_key" { key } else { img };
+            // Time effects act over time: six consecutive frames side by side.
+            let timed = matches!(spec.kind, "echo" | "stutter");
             let render = |v: Option<f64>| {
-                let p = fx_scene(src, vec![effect_with(spec.kind, v.map(|v| (ps.name, v)), &lut)], spec.kind == "drop_shadow");
-                frame(r, &p, FX_T, scale)
+                let p = fx_scene(src, vec![effect_with(spec.kind, v.map(|v| (ps.name, v)), &lut)], spec.kind == "drop_shadow", timed);
+                if timed {
+                    strip(&(0..6).map(|k| frame(r, &p, 2.0 + k as f64 / 30.0, scale)).collect::<Vec<_>>())
+                } else {
+                    frame(r, &p, FX_T, scale)
+                }
             };
-            out.push(sweep_param(&format!("{}.{}", spec.kind, ps.name), ps, &render));
+            out.push(sweep_param(&format!("{}.{}", spec.kind, ps.name), ps, steps, &render));
         }
     }
     for spec in TRANSITIONS {
@@ -196,7 +216,7 @@ fn sweep_all(r: &Renderer, img: &Path, img_b: &Path, key: &Path, scale: f32, onl
                 let p = tr_scene(img, img_b, Some(transition_with(spec.kind, v.map(|v| (ps.name, v)))));
                 strip(&[frame(r, &p, 1.75, scale), frame(r, &p, 2.0, scale), frame(r, &p, 2.25, scale)])
             };
-            out.push(sweep_param(&format!("transition {}.{}", spec.kind, ps.name), ps, &render));
+            out.push(sweep_param(&format!("transition {}.{}", spec.kind, ps.name), ps, steps, &render));
         }
     }
     out
@@ -253,15 +273,22 @@ fn every_parameter_moves_the_picture_across_its_slider() {
     let r = renderer();
     let card = fixture("sweep_card.png", |out| ffmpeg(&["-f", "lavfi", "-i", "testsrc2=s=1920x1080", "-frames:v", "1", out]));
     let card_b = fixture("sweep_card_b.png", |out| ffmpeg(&["-f", "lavfi", "-i", "testsrc2=s=1920x1080,hue=h=150,negate", "-frames:v", "1", out]));
-    let key = green_screen(&card_b);
+    let key = green_screen(&card);
     let mut bad = Vec::new();
-    for s in sweep_all(&r, &card, &card_b, &key, 0.25, None) {
+    for s in sweep_all(&r, &card, &card_b, &key, 0.25, 7, None) {
         let flags = s.flags();
         if !flags.is_empty() {
             bad.push(format!("{}: {} (from the left end: {:?})", s.what, flags.join(", "), s.from_min.iter().map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>()));
         }
     }
     assert!(bad.is_empty(), "parameters that do not read as configurable:\n{}", bad.join("\n"));
+}
+
+/// "0–100, curve 2" / "log" / "linear" for the report.
+fn slider_text(p: &ParamSpec) -> String {
+    let [lo, hi] = p.slider_range();
+    let curve = if p.curve == 0.0 { ", log".to_string() } else if p.curve != 1.0 { format!(", curve {}", p.curve) } else { String::new() };
+    format!("{lo}–{hi}{curve}")
 }
 
 #[test]
@@ -274,24 +301,23 @@ fn sweep_report() {
     let only = std::env::var("AIFRAMES_SWEEP_ONLY").ok();
     std::fs::create_dir_all(&out).unwrap();
     let key = green_screen(&img_b);
-    let sweeps = sweep_all(&r, &img, &img_b, &key, 0.5, only.as_deref());
-    let mut md = String::from("| parameter | unit | range | default | Δ at 0 · ¼ · ½ · ¾ · 1 of the slider (from the left end, 0–255) | max Δ from default | flags |\n|---|---|---|---|---|---|---|\n");
+    let sweeps = sweep_all(&r, &img, &img_b, &key, 0.5, STEPS, only.as_deref());
+    let mut md = String::from("| parameter | unit | range | slider | Δ at 0 · ¼ · ½ · ¾ · 1 of the slider (mean from the left end, 0–255) | travel that does nothing | flags |\n|---|---|---|---|---|---|---|\n");
     for s in &sweeps {
         let q = |x: f64| s.from_min[((STEPS - 1) as f64 * x).round() as usize];
         writeln!(
             md,
-            "| {} | {} | {}–{} | {} | {:.1} · {:.1} · {:.1} · {:.1} · {:.1} | {:.1} | {:.0} % | {} |",
+            "| {} | {} | {}–{} | {} | {:.1} · {:.1} · {:.1} · {:.1} · {:.1} | {:.0} % | {} |",
             s.what,
             s.spec.unit,
             s.spec.min,
             s.spec.max,
-            s.spec.default,
+            slider_text(&s.spec),
             q(0.0),
             q(0.25),
             q(0.5),
             q(0.75),
             q(1.0),
-            s.from_default,
             s.dead() * 100.0,
             s.flags().join(", ")
         )

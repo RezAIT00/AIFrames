@@ -200,7 +200,7 @@ pub static EFFECTS: &[EffectSpec] = &[
             MASK_W,
             MASK_H,
             MASK_FEATHER,
-            p("radius", "Corner radius", 0.0, 0.0, 2000.0, "px", "Rounds the rectangle's corners.").soft(0.0, 540.0).curve(1.5),
+            p("radius", "Corner radius", 0.0, 0.0, 2000.0, "px", "Rounds the rectangle's corners (up to half the shorter side).").soft(0.0, 300.0).curve(1.5),
             MASK_INVERT,
         ],
         colors: &[],
@@ -386,7 +386,7 @@ pub static EFFECTS: &[EffectSpec] = &[
         label: "Echo",
         category: "motion",
         params: &[
-            p("count", "Echoes", 3.0, 1.0, 12.0, "count", "Number of trailing copies."),
+            p("count", "Echoes", 3.0, 1.0, 12.0, "count", "Number of trailing copies (with a low decay the far ones fade out).").soft(1.0, 6.0),
             p("interval", "Interval", 0.05, 0.001, 5.0, "s", "Time between echoes: echo k shows the clip at t - k × interval.").soft(0.01, 1.0).log(),
             p("decay", "Decay", 0.5, 0.0, 1.0, "frac", "Opacity of each echo relative to the previous one."),
             p(
@@ -483,7 +483,7 @@ pub static TRANSITIONS: &[TransitionSpec] = &[
     TransitionSpec { kind: "push_up", label: "Push up", params: &[], help: "The incoming clip pushes the outgoing one off the top.", default_duration: 0.4, colors: &[] },
     TransitionSpec { kind: "push_down", label: "Push down", params: &[], help: "The incoming clip pushes the outgoing one off the bottom.", default_duration: 0.4, colors: &[] },
     TransitionSpec { kind: "zoom_in", label: "Zoom in", params: &[ZOOM_AMOUNT], help: "Punches into the outgoing clip and lands on the incoming one.", default_duration: 0.4, colors: &[] },
-    TransitionSpec { kind: "zoom_out", label: "Zoom out", params: &[ZOOM_AMOUNT], help: "The incoming clip starts zoomed in and settles to full frame.", default_duration: 0.4, colors: &[] },
+    TransitionSpec { kind: "zoom_out", label: "Zoom out", params: &[ZOOM_AMOUNT], help: "The outgoing clip shrinks away while the incoming one starts zoomed in and settles to full frame.", default_duration: 0.4, colors: &[] },
     TransitionSpec {
         kind: "iris",
         label: "Iris",
