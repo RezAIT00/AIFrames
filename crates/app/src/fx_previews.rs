@@ -323,6 +323,9 @@ const LOOP_HOLD: u64 = 5;
 /// Most steps one pass of the loop takes (long transitions are sampled more coarsely).
 const LOOP_STEPS: u64 = 18;
 
+/// The hover plan and what it was made from: (item, document snapshot key, selection, plan).
+type HoverPlan = (BrowserDrag, (u64, u64, u64), Vec<Id>, Option<PreviewPlan>);
+
 /// Drives the live preview of the hovered browser item in the program viewer. After a short dwell it
 /// returns, every frame, the ops of what a click would do; the app shows them through its transient
 /// op preview (a scratch copy of the document on the playback engine; nothing enters the history) and
@@ -335,7 +338,7 @@ pub struct HoverCtl {
     item: Option<BrowserDrag>,
     since: f64,
     /// The plan for (item, document snapshot key, selection), kept while they stay the same.
-    plan: Option<(BrowserDrag, (u64, u64, u64), Vec<Id>, Option<PreviewPlan>)>,
+    plan: Option<HoverPlan>,
     /// (document, playhead before the preview moved it, where it moved it).
     restore: Option<(u64, f64, f64)>,
     /// The playhead was checked for this plan (and since when a transition loops in the viewer).

@@ -183,8 +183,8 @@ pub(crate) fn preview_effects(s: &Arc<Services>, args: &J) -> ToolResult {
                 failed.push(json!({"kind": t.kind, "error": e}));
                 // A red tile keeps the grid in order and makes the failure visible.
                 let mut red = Image::new(tw, th);
-                for px in red.rgba.chunks_exact_mut(4) {
-                    px.copy_from_slice(&[0x90, 0x10, 0x18, 0xFF]);
+                for px in red.rgba.as_chunks_mut::<4>().0 {
+                    *px = [0x90, 0x10, 0x18, 0xFF];
                 }
                 grid_tiles.push((red, format!("{} — FAILED", t.label)));
             }

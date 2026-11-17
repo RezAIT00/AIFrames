@@ -338,8 +338,8 @@ pub fn grid(rd: &Renderer, tiles: &[(Image, String)], cols: u32) -> Result<Image
     let cols = cols.clamp(1, tiles.len() as u32);
     let rows = (tiles.len() as u32).div_ceil(cols);
     let mut out = Image::new(cols * (tw + gap) + gap, rows * (th + lh + gap) + gap);
-    for px in out.rgba.chunks_exact_mut(4) {
-        px.copy_from_slice(&[0x12, 0x12, 0x15, 0xFF]);
+    for px in out.rgba.as_chunks_mut::<4>().0 {
+        *px = [0x12, 0x12, 0x15, 0xFF];
     }
     for (i, (img, label)) in tiles.iter().enumerate() {
         let (c, r) = (i as u32 % cols, i as u32 / cols);
