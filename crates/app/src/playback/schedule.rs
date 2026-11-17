@@ -55,6 +55,28 @@ pub fn pick<T>(ready: &BTreeMap<i64, T>, clock: i64, dir: i64) -> Option<i64> {
     }
 }
 
+/// The frame to show while playing: the clock's frame, except near a frame boundary. At 1x, when
+/// the clock is within a quarter frame of a boundary, the frame after the last one shown is
+/// chosen; a display refreshing at the frame rate then shows every frame once, instead of
+/// skipping one and holding the next whenever its refreshes jitter around the boundaries (as
+/// they do when the clock started on a refresh). Faster rates take the clock's frame.
+pub fn paced_frame(t: f64, fps: f64, last: Option<i64>, step: i64) -> i64 {
+    let f = crate::timecode::frame_index(t, fps);
+    let Some(l) = last else { return f };
+    if step.abs() != 1 {
+        return f;
+    }
+    let margin = 0.25 / crate::timecode::safe_fps(fps) * step as f64;
+    let next = l + step;
+    if f == next + step && crate::timecode::frame_index(t - margin, fps) == next {
+        return next;
+    }
+    if f == l && crate::timecode::frame_index(t + margin, fps) == next {
+        return next;
+    }
+    f
+}
+
 /// Removes frames the playhead has passed (keeps `keep_behind` frames behind it).
 pub fn drop_passed<T>(ready: &mut BTreeMap<i64, T>, clock: i64, dir: i64, keep_behind: i64) {
     if dir >= 0 {
@@ -143,6 +165,33 @@ mod tests {
         let mut m: BTreeMap<i64, ()> = [3, 4, 5, 7, 9].into_iter().map(|k| (k, ())).collect();
         drop_passed(&mut m, 5, -1, 0);
         assert_eq!(m.keys().copied().collect::<Vec<_>>(), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn pacing_absorbs_jitter_at_frame_boundaries() {
+        let fps = 60.0;
+        let d = 1.0 / fps;
+        // Refreshes right on the boundaries, jittering by a millisecond either way: every frame
+        // once, in order.
+        let mut last = None;
+        let mut shown = Vec::new();
+        for k in 0..120 {
+            let jitter = if k % 3 == 0 { 0.001 } else if k % 3 == 1 { -0.001 } else { 0.0 };
+            let t = k as f64 * d + jitter;
+            let f = paced_frame(t, fps, last, 1);
+            shown.push(f);
+            last = Some(f);
+        }
+        assert!(shown.windows(2).all(|w| w[1] == w[0] + 1), "{shown:?}");
+        // Real lateness still skips: half a frame past the next boundary is not jitter.
+        assert_eq!(paced_frame(12.0 * d + 0.5 * d, fps, Some(10), 1), 12);
+        // Reverse play mirrors it (frame 9 is shown for clock times 9/fps..10/fps).
+        assert_eq!(paced_frame(9.0 * d - 0.001, fps, Some(10), -1), 9, "just past the 9|8 boundary");
+        assert_eq!(paced_frame(10.0 * d + 0.001, fps, Some(10), -1), 9, "just before the 10|9 boundary");
+        assert_eq!(paced_frame(8.5 * d, fps, Some(10), -1), 8, "real lateness");
+        // Shuttle speeds and the first frame take the clock's frame.
+        assert_eq!(paced_frame(12.0 * d + 0.001, fps, Some(10), 2), 12);
+        assert_eq!(paced_frame(12.0 * d + 0.001, fps, None, 1), 12);
     }
 
     #[test]

@@ -18,10 +18,14 @@ use std::time::Duration;
 
 /// Hardware decoding choice for video sessions.
 ///
-/// Measured on a high-end NVIDIA GPU + 24-core CPU (ffmpeg 9): CPU decoding was faster than NVDEC and
-/// D3D11VA in every case tried — 1080p and 4K, H.264 and 10-bit HEVC, full size and 960x540
-/// previews, sequential and seeking (GPU decode has to download each frame and pays ~100-300 ms of
-/// device setup per seek). So `Auto` decodes on the CPU; the GPU modes are for machines with weak CPUs.
+/// `Auto` decodes heavy streams (HEVC, AV1, VP9, more than 8 bits, above 1440p) with D3D11VA and
+/// everything else on the CPU. Measured with `aiframes --bench-playback --tests decode` (ffmpeg 9,
+/// frames at preview size): 4K 10-bit HEVC on 4 cores ran at 37 fps with 100 ms of CPU per frame and
+/// 1.1 s seeks on the CPU, 81 fps / 41 ms / 0.54 s with D3D11VA; on 24 cores the CPU was a little
+/// faster (114 vs 91 fps) but used 2.5x the CPU time. 8-bit H.264 up to 1080p gained nothing on the
+/// GPU (its decode is cheap next to the RGBA conversion and compositing) and seeked slower there
+/// (device setup per seek: 1.5 s instead of 0.64 s for a 250-frame GOP), so it stays on the CPU. If
+/// the GPU path fails, the pool falls back to the CPU for good.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum HwAccel {
     /// Always decode on the CPU.

@@ -154,6 +154,23 @@ impl Renderer {
         compose::FrameJob { rd: self, doc_dir, p, tl: &tl, strict: false, caching: aiframes_media::FrameCaching::Normal }.render(t, o)
     }
 
+    /// (addition) Media clips whose picture starts being needed in `(t0, t1]` (a clip's first
+    /// frame, or the start of a transition into it) on tracks that show pictures: (time, clip id).
+    pub fn media_starts(&self, p: &Project, r: &Resolved, t0: f64, t1: f64) -> Vec<(f64, Id)> {
+        timeline::Timeline::new(p, r).media_starts(t0, t1).into_iter().map(|(t, id)| (t, id.to_string())).collect()
+    }
+
+    /// (addition) Decodes the picture clip `clip` shows at timeline time `t` into the pool's cache,
+    /// at the size a frame rendered with `o` asks for, without compositing. It uses a decoder of
+    /// its own (never one playback is reading from), which then continues from there: playback
+    /// calls it for [`Renderer::media_starts`] a second ahead, so a cut does not wait for a seek.
+    pub fn prefetch_clip(&self, doc_dir: &Path, p: &Project, r: &Resolved, clip: &str, t: f64, o: &FrameOptions) {
+        let tl = timeline::Timeline::new(p, r);
+        if let Ok(v) = compose::OutputView::scaled(&p.settings, o.scale) {
+            compose::FrameJob { rd: self, doc_dir, p, tl: &tl, strict: false, caching: aiframes_media::FrameCaching::Ahead }.prefetch_clip(clip, t, &v, o.draft);
+        }
+    }
+
     /// (addition) Like [`Renderer::frame`] but any missing media, LUT or unknown effect is an error
     /// (what export uses).
     pub fn frame_strict(&self, doc_dir: &Path, p: &Project, r: &Resolved, t: f64, o: &FrameOptions) -> Result<Image, RenderError> {

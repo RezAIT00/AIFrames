@@ -53,7 +53,11 @@ installed copies pick it up on their next check.
   later clips move right) or Overwrite (`.`) the range at the timeline playhead, or drag the picture onto a
   track (Ctrl = insert), like Premiere. The AI does the same with `source_monitor`.
 - **Viewer**: smooth playback with the sound as master clock (J/K/L shuttle with 2×/4× audio, scrub audio,
-  frame steps, loop in/out), on-canvas move/scale/rotate handles, safe-area guides, render warnings.
+  frame steps, loop in/out), on-canvas move/scale/rotate handles, safe-area guides, render warnings. Preview
+  resolution Auto / Full / ½ / ¼: Auto follows the viewer size and steps down while playback drops frames
+  (the quality menu then reads e.g. "Auto 50%"); a frame-rate badge turns amber when frames are dropped.
+  Upcoming cuts and transitions open their decoders a second early; HEVC, AV1, VP9 and 4K H.264 decode on the
+  GPU (D3D11VA, CPU fallback).
 - **Inspector**: everything about the selection, every animatable value with keyframe controls, text (system
   fonts, outline, shadow, pill background, reveals, karaoke highlight) and shapes with draw-on, project and
   export settings.
@@ -117,6 +121,8 @@ Needs ffmpeg on PATH (Whisper optional, for transcription).
 cargo build --release                          # target\release\aiframes.exe
 cargo test
 target\release\aiframes.exe --selftest         # builds, plays, edits and exports a generated project
+target\release\aiframes.exe --bench-playback p.aifr --cores 4   # viewer playback, seek, scrub, step and loop
+                                               # numbers (and wrong-frame check) on a few cores
 target\release\aiframes.exe demo out\demo      # then open out\demo\demo.aifr
 scripts\install.ps1                            # install for this user and register .aifr
 ```

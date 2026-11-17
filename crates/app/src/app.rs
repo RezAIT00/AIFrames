@@ -1489,7 +1489,10 @@ impl AiFramesApp {
                 self.viewer.zoom = z;
                 self.viewer.pan = egui::Vec2::ZERO;
             }
-            Cmd::Quality(q) => self.viewer.quality = q,
+            Cmd::Quality(q) => {
+                self.viewer.quality = q;
+                self.engine.reset_auto_quality();
+            }
             Cmd::Connect => self.dialogs.connect = true,
             Cmd::About => self.dialogs.about = true,
             Cmd::CopyEndpoint => {
@@ -2418,8 +2421,10 @@ impl eframe::App for AiFramesApp {
         if let Some((id, _)) = &active {
             self.pre_frame(*id);
             if self.viewer.display_px > 0.0 {
-                let scale = self.viewer.quality.scale(self.viewer.display_px, self.engine.snapshot().project.settings.width);
-                self.engine.set_scale(scale);
+                let q = self.viewer.quality;
+                let scale = q.scale(self.viewer.display_px, self.engine.snapshot().project.settings.width);
+                // Auto may also be lowered by the engine while playback drops frames.
+                self.engine.set_quality(scale, q == Quality::Auto);
             }
             playhead = self.engine.update();
             // (added) One monitor plays at a time: the one started last wins.
@@ -2597,6 +2602,12 @@ impl eframe::App for AiFramesApp {
                 let rate = self.engine.rate();
                 let playing = self.engine.playing();
                 let render_scale = self.engine.stats.scale;
+                let perf = crate::viewer::PlaybackPerf {
+                    fps: self.engine.stats.fps,
+                    target_fps: self.engine.stats.target_fps,
+                    dropped_recent: self.engine.stats.dropped_recent,
+                    lowered_from: self.engine.stats.lowered_from,
+                };
                 let looping = self.engine.looping;
                 let (volume, muted) = (self.engine.volume, self.engine.muted);
                 let mut g = lock(doc_ref);
@@ -2717,6 +2728,7 @@ impl eframe::App for AiFramesApp {
                     warnings: &warnings,
                     volume,
                     muted,
+                    perf,
                 };
                 let fx_hovered = if self.side_tab == SideTab::Effects && layout.show_side { w.effects.hovered.clone() } else { None };
                 let mut vout = Default::default();

@@ -2,7 +2,7 @@
 //! crop → fit → transform → effects → opacity × fade → blend onto the canvas. Adjustment clips
 //! apply their effects to the composite below. Transitions combine both clips around the cut.
 
-use crate::canvas::{accumulate, accumulate_res, blend_layer, draw_raster, draw_raster_over, mix_layers, over_union, premul, transform_layer, AccItem, AccSource, Layer, Picture, Px, RasterDraw};
+use crate::canvas::{accumulate, accumulate_res, blend_layer, draw_raster, draw_raster_over, mix_layers, over_union, premul, raster_over_rgba8, transform_layer, AccItem, AccSource, Layer, Picture, Px, RasterDraw};
 use crate::effects::{apply_effects, shake_offset, FxCtx};
 use crate::geom::{m3_apply, m3_mul, plane_homography, rot_x, rot_y, rot_z, Affine, IRect, Proj};
 use crate::text::{self, TextLayout, TextState};
@@ -375,16 +375,15 @@ struct Visual<'c> {
 
 /// Picture size to request so that roughly one or two source pixels land on each output pixel
 /// (power-of-two steps of the native size so decode sessions stay stable while scale animates).
-/// `k` = output pixels per box pixel (the largest local scale).
-fn request_size(sw: f64, sh: f64, cw: f64, ch: f64, bw: f64, bh: f64, k: f64, draft: bool) -> Option<(u32, u32)> {
+/// `k` = output pixels per box pixel (the largest local scale). Drafts (scrubbing) ask for the same
+/// size as full frames: they then share one decode session and its cached frames, so the full
+/// frame after a scrub is not another seek.
+fn request_size(sw: f64, sh: f64, cw: f64, ch: f64, bw: f64, bh: f64, k: f64) -> Option<(u32, u32)> {
     let k = (k * bw / cw.max(1e-9)).max(k * bh / ch.max(1e-9));
     if !k.is_finite() || k <= 0.0 {
         return Some((16, 16));
     }
-    let mut level = if k >= 1.0 { 0 } else { (1.0 / k).log2().floor() as i32 };
-    if draft {
-        level += 1;
-    }
+    let level = if k >= 1.0 { 0 } else { (1.0 / k).log2().floor() as i32 };
     let mut level = level.clamp(0, 8);
     while level > 0 && (sw / 2f64.powi(level) < 16.0 || sh / 2f64.powi(level) < 16.0) {
         level -= 1;
@@ -480,7 +479,7 @@ fn visual_at<'c>(cx: &Ctx, clip: &'c Clip, t_local: f64, t_frame: f64) -> Result
         BoxKind::Media { path, kind, sw, sh, crop } => {
             let cw = sw * (1.0 - crop[0] - crop[2]);
             let chh = sh * (1.0 - crop[1] - crop[3]);
-            let max = request_size(sw, sh, cw, chh, b.bw, b.bh, k, cx.draft);
+            let max = request_size(sw, sh, cw, chh, b.bw, b.bh, k);
             let got = match kind {
                 MediaKind::Image => cx.rd.pool().image(&path, max).map(|f| Picture { w: f.width, h: f.height, data: f.rgba, premul: false }),
                 _ => {
@@ -1139,6 +1138,38 @@ fn draw_first(cx: &Ctx, canvas: &mut Layer, clip: &Clip, span: Span, bg: Px) -> 
     Ok(true)
 }
 
+/// The whole frame as straight RGBA8 when it is a single plain picture over the background (one
+/// video, still or solid clip without effects, normal blend, not rotated) — most frames of most
+/// edits. `None`: composite in general. Same pixels as `composite` + `Layer::to_rgba8`.
+fn plain_frame(cx: &Ctx, bg: Px) -> Result<Option<Vec<u8>>, RenderError> {
+    let mut only = None;
+    for (ti, info) in cx.tl.tracks.iter().enumerate() {
+        if !cx.tl.shows_picture(info.track) {
+            continue;
+        }
+        for act in cx.tl.active_at(ti, cx.t) {
+            if let Active::One(c, _) = act {
+                if cx.tl.matte_sources.contains(&c.id) {
+                    continue;
+                }
+            }
+            if only.is_some() {
+                return Ok(None);
+            }
+            only = Some(act);
+        }
+    }
+    let Some(Active::One(clip, span)) = only else { return Ok(None) };
+    if clip.blend != BlendMode::Normal || !plain(clip) || !matches!(clip.source, Source::Media { .. } | Source::Solid { .. }) {
+        return Ok(None);
+    }
+    // As `draw_first`.
+    let t_frame = local_time(cx.t, &span, cx.tl.tol);
+    let Some(v) = visual_at(cx, clip, stutter_time(clip, t_frame), t_frame)? else { return Ok(None) };
+    let Some(d) = v.raster(v.opacity as f32, cx.draft) else { return Ok(None) };
+    Ok(raster_over_rgba8(&d, bg, cx.out_w, cx.out_h))
+}
+
 /// Walks the tracks at `cx.t`. `fill`: the canvas is not initialised yet; it must end up with this
 /// background colour under everything.
 fn composite(cx: &Ctx, mut canvas: Option<&mut Layer>, mut fill: Option<Px>) -> Result<(), RenderError> {
@@ -1314,11 +1345,15 @@ impl FrameJob<'_> {
     pub fn render_view(&self, t: f64, v: &OutputView, draft: bool) -> Result<(Image, Vec<String>), RenderError> {
         let cx = self.ctx(t, v, draft, false);
         let bg = self.p.settings.background;
-        // The canvas is initialised by the first layer (drawn over the background) or a fill.
-        let mut canvas = Layer::dirty(cx.out_w, cx.out_h);
-        composite(&cx, Some(&mut canvas), Some(premul(bg)))?;
-        let rgba = canvas.to_rgba8();
-        drop(canvas);
+        let rgba = match plain_frame(&cx, premul(bg))? {
+            Some(rgba) => rgba,
+            None => {
+                // The canvas is initialised by the first layer (drawn over the background) or a fill.
+                let mut canvas = Layer::dirty(cx.out_w, cx.out_h);
+                composite(&cx, Some(&mut canvas), Some(premul(bg)))?;
+                canvas.to_rgba8()
+            }
+        };
         let warnings = cx.warnings.into_inner().unwrap_or_else(|p| p.into_inner());
         if (v.cw, v.ch) == (v.out_w, v.out_h) {
             return Ok((Image { width: v.out_w, height: v.out_h, rgba }, warnings));
@@ -1346,6 +1381,14 @@ impl FrameJob<'_> {
     pub fn prefetch(&self, t: f64, v: &OutputView, draft: bool) {
         let cx = self.ctx(t, v, draft, true);
         let _ = composite(&cx, None, None);
+    }
+
+    /// Fetches the picture one clip shows at `t` (also before its start, inside a transition).
+    pub fn prefetch_clip(&self, clip: &str, t: f64, v: &OutputView, draft: bool) {
+        let cx = self.ctx(t, v, draft, true);
+        if let Some((c, span)) = self.tl.by_id.get(clip) {
+            let _ = prefetch_clip(&cx, c, *span);
+        }
     }
 }
 

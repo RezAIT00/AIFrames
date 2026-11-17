@@ -132,6 +132,29 @@ impl<'a> Timeline<'a> {
         !tr.muted && (!self.solo_any || tr.solo)
     }
 
+    /// Media clips whose picture starts being needed in `(t0, t1]`, with that time: their first
+    /// frame, or the start of the transition into them (which shows frames from before their
+    /// in-point). Sorted by time.
+    pub fn media_starts(&self, t0: f64, t1: f64) -> Vec<(f64, &'a str)> {
+        let mut out: Vec<(f64, &'a str)> = Vec::new();
+        for info in &self.tracks {
+            if !self.shows_picture(info.track) {
+                continue;
+            }
+            for (i, (c, s)) in info.clips.iter().enumerate() {
+                if !c.enabled || !matches!(c.source, Source::Media { .. }) || self.matte_sources.contains(&c.id) {
+                    continue;
+                }
+                let start = info.trans.iter().filter(|x| x.to == i).map(|x| x.start()).fold(s.start, f64::min);
+                if start > t0 && start <= t1 {
+                    out.push((start, c.id.as_str()));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.total_cmp(&b.0));
+        out
+    }
+
     /// What a track shows at `t`, in drawing order.
     pub fn active_at<'b>(&'b self, ti: usize, t: f64) -> Vec<Active<'a, 'b>> {
         let info = &self.tracks[ti];
