@@ -367,6 +367,7 @@ impl Inspector {
                     }
                 }
             });
+            self.attributes_menu(ui, cs, None, out);
             if ui.button("Ask AI").clicked() {
                 out.push(UiAction::AskAi { prompt: format!("About clips {}: ", ids.join(", ")), ids: ids.clone() });
             }
@@ -388,6 +389,7 @@ impl Inspector {
             }
         });
         let mut ops: Vec<(String, Op)> = Vec::new();
+        let previews_before = out.iter().filter(|a| matches!(a, UiAction::Preview(_))).count();
         Grid::new(("trans", &t.id)).num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
             lbl(ui, "Kind");
             let mut k = t.kind.clone();
@@ -405,6 +407,7 @@ impl Inspector {
             self.transition_duration_row(ui, cx, t, &mut ops, out);
             self.transition_params(ui, t, &mut ops, out);
         });
+        Self::seek_into_transition(cx, t, previews_before, out);
         if let Some(s) = spec {
             ui.add(egui::Label::new(RichText::new(s.help).small().weak()).wrap());
             if s.params.is_empty() && s.colors.is_empty() {

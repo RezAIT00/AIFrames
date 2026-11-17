@@ -752,7 +752,7 @@ pub fn slider_value(p: &ParamSpec, f: f64) -> f64 {
 /// the inverse of [`slider_value`].
 pub fn slider_pos(p: &ParamSpec, v: f64) -> f64 {
     let [lo, hi] = p.slider_range();
-    if !(hi > lo) || !v.is_finite() {
+    if lo.is_nan() || hi.is_nan() || hi <= lo || !v.is_finite() {
         return 0.0;
     }
     let v = v.clamp(lo, hi);

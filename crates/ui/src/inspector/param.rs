@@ -164,6 +164,10 @@ impl Inspector {
                 edit = Some(ParamEdit::Value(v));
             } else if let Some(v) = r.live {
                 out.push(UiAction::Preview(vec![param_op(&c.id, path, param, local, ParamEdit::Value(v))]));
+                if !local.inside {
+                    // Nothing of the clip is in the viewer: show its nearest frame while dragging.
+                    out.push(UiAction::Seek(local.start + local.t.min(local.dur - 1.0 / local.fps).max(0.0)));
+                }
             }
             if let Some(d) = default {
                 if is_changed(param, d) && reset_button(ui, &format!("Reset to {}", spec_text(spec, d))).clicked() {

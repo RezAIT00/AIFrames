@@ -531,6 +531,16 @@ impl Inspector {
         }
     }
 
+    /// While a transition setting is being dragged (a preview was sent), the playhead moves to the
+    /// cut when it is outside the transition, so the viewer shows what changes.
+    pub(crate) fn seek_into_transition(cx: &EditCtx, t: &Transition, previews_before: usize, out: &mut Vec<UiAction>) {
+        let previewing = out.iter().filter(|a| matches!(a, UiAction::Preview(_))).count() > previews_before;
+        let Some(span) = cx.resolved.span(&t.from) else { return };
+        if previewing && (cx.playhead - span.end).abs() > t.duration / 2.0 {
+            out.push(UiAction::Seek(span.end));
+        }
+    }
+
     /// "Copy attributes / Paste attributes" for the clip panel header (Premiere's Paste Attributes).
     pub(crate) fn attributes_menu(&mut self, ui: &mut Ui, targets: &[&Clip], source: Option<&Clip>, out: &mut Vec<UiAction>) {
         ui.menu_button("Attributes", |ui| {
@@ -599,12 +609,14 @@ impl Inspector {
                         ui.label(RichText::new("TRANSITION").small().strong());
                         ui.label(RichText::new(format!("{} · {}", t.id, transition_spec(&t.kind).map(|s| s.label).unwrap_or(&t.kind))).small().weak());
                     });
+                    let before = out.iter().filter(|a| matches!(a, UiAction::Preview(_))).count();
                     egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("aiframes_tr_controls_scroll").show(ui, |ui| {
                         Grid::new(("trdock", &t.id)).num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                             self.transition_duration_row(ui, cx, t, &mut ops, &mut out);
                             self.transition_params(ui, t, &mut ops, &mut out);
                         });
                     });
+                    Self::seek_into_transition(cx, t, before, &mut out);
                     for (l, op) in ops.drain(..) {
                         out.push(UiAction::Apply { label: format!("{l} ({})", t.id), ops: vec![op] });
                     }
