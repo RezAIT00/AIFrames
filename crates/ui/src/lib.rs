@@ -122,6 +122,10 @@ pub enum UiAction {
     RevealMedia(Id),
     /// (added) Ask the person for a new file for this (offline/moved) media asset, then `relink_media`.
     RelinkMedia(Id),
+    /// (added) Show the program viewer as if these ops were applied, without touching the document
+    /// or its history (live slider drags, hover previews). Send it every frame the preview should
+    /// last; the first frame without one ends it. Ops that do not apply are skipped quietly.
+    Preview(Vec<Op>),
 }
 
 /// Drag-and-drop payload for media dragged from the bin onto the timeline or viewer.

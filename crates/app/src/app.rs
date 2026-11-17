@@ -27,6 +27,14 @@ pub const APP_NAME: &str = "AIFrames";
 const MEDIA_EXTS: &[&str] = &["mp4", "mov", "mkv", "webm", "avi", "m4v", "mxf", "mts", "ts", "wmv", "flv", "mp3", "wav", "aac", "m4a", "flac", "ogg", "opus", "aif", "aiff", "wma", "png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "exr"];
 
 /// The editing widgets of one project.
+/// What the viewer shows for a `UiAction::Preview`: the ops, the document snapshot they were
+/// applied to, and whether they applied (failed ones show the document unchanged).
+struct OpsPreview {
+    ops: Vec<Op>,
+    key: (u64, u64, u64),
+    shown: bool,
+}
+
 #[derive(Default)]
 pub struct Widgets {
     pub timeline: Timeline,
@@ -172,6 +180,10 @@ pub struct AiFramesApp {
     layers: ((u64, u64, u64), i64, Vec<LayerBox>),
     live_preview: Option<LivePreview>,
     preview_epoch: u64,
+    /// The latest `UiAction::Preview` of this frame (last wins).
+    frame_preview: Option<Vec<Op>>,
+    /// The ops preview the viewer shows (see [`App::finish_ops_preview`]).
+    ops_preview: Option<OpsPreview>,
     jobs_seen: HashSet<u64>,
     export_paths: HashMap<u64, PathBuf>,
     last_export: Option<PathBuf>,
@@ -273,6 +285,8 @@ impl AiFramesApp {
             layers: ((u64::MAX, 0, 0), 0, Vec::new()),
             live_preview: None,
             preview_epoch: 0,
+            frame_preview: None,
+            ops_preview: None,
             jobs_seen: HashSet::new(),
             export_paths: HashMap::new(),
             last_export: None,
@@ -919,7 +933,7 @@ impl AiFramesApp {
             self.engine_doc = Some(id);
             let t = self.docs.get(&id).map(|d| d.playhead).unwrap_or(0.0);
             self.engine.seek(t.min(dur.max(0.0)), false);
-        } else if self.live_preview.is_none() {
+        } else if self.live_preview.is_none() && !self.ops_preview.as_ref().is_some_and(|p| p.shown) {
             self.engine.set_snapshot(snap);
         }
         if let Some(t) = seek {
@@ -967,6 +981,41 @@ impl AiFramesApp {
         self.engine.set_snapshot(snap);
         self.engine.set_scrubbing(true);
         let _ = PARAM_PATHS;
+    }
+
+    /// Shows this frame's `UiAction::Preview` (uncommitted ops: a slider being dragged, an effect
+    /// being hovered) in the viewer. The transient snapshot is rebuilt only when the ops or the
+    /// document's snapshot change; ops that do not apply are skipped quietly. The first frame without
+    /// a preview hands the viewer back to the document (its new revision if the preview was just
+    /// committed), so the picture never jumps back to the state before the drag.
+    fn finish_ops_preview(&mut self, id: Option<u64>, ctx: &egui::Context) {
+        let want = self.frame_preview.take();
+        let base = id.and_then(|id| self.docs.get(&id)).and_then(|d| d.snap.clone());
+        match (want, base) {
+            (Some(ops), Some(base)) if self.live_preview.is_none() && self.engine_doc == id => {
+                let key = base.key();
+                if self.ops_preview.as_ref().is_some_and(|p| p.ops == ops && p.key == key) {
+                    return;
+                }
+                let mut project = base.project.clone();
+                let shown = aiframes_core::apply_batch(&mut project, &ops).is_ok();
+                if shown {
+                    let resolved = aiframes_core::resolve(&project);
+                    self.preview_epoch += 1;
+                    let snap = Arc::new(Snapshot { doc: base.doc, revision: base.revision, epoch: 1_000_000 + self.preview_epoch, project, resolved, dir: base.dir.clone() });
+                    self.engine.set_snapshot(snap);
+                } else if self.ops_preview.as_ref().is_some_and(|p| p.shown) {
+                    self.engine.set_snapshot(base);
+                }
+                self.ops_preview = Some(OpsPreview { ops, key, shown });
+            }
+            _ => {
+                if self.ops_preview.take().is_some_and(|p| p.shown) {
+                    // The next frame's snapshot refresh puts the document back on the engine.
+                    ctx.request_repaint();
+                }
+            }
+        }
     }
 
     fn layers_for(&mut self, snap: &Snapshot, t: f64) -> Vec<LayerBox> {
@@ -1047,6 +1096,7 @@ impl AiFramesApp {
                 }
             }
             UiAction::RelinkMedia(asset) => self.relink(id, &asset),
+            UiAction::Preview(ops) => self.frame_preview = Some(ops),
             #[allow(unreachable_patterns)]
             _ => {}
         }
@@ -2566,6 +2616,8 @@ impl eframe::App for AiFramesApp {
                 self.handle_action(id, a, &ctx);
             }
         }
+        // After every widget ran: the last `UiAction::Preview` of the frame wins.
+        self.finish_ops_preview(active_id, &ctx);
         // AI edits to bring into view (after the timeline laid itself out this frame).
         if let Some((id, ids, at, latest)) = self.pending_follow.clone() {
             if self.now - at >= 1.2 {
