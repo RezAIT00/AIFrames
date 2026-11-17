@@ -188,7 +188,7 @@ pub fn import_plan_for(project: &Project, project_file: Option<&Path>, pool: &Me
             if let (Some(m), Ok((_, info))) = (existing.get(&key), pool.probe(&abs)) {
                 if media_info_changed(&m.info, &info) {
                     refreshed.push((m.id.clone(), m.path.clone(), info));
-                    skipped.push((f, "already in the project (the file changed: its info was refreshed)".into()));
+                    skipped.push((f, "already in the project (its stored info was out of date — the file changed, or has sound streams an older AIFrames did not list — and was refreshed)".into()));
                     continue;
                 }
             }
