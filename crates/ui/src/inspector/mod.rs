@@ -635,7 +635,16 @@ impl Inspector {
                 ui.label(format!("{}×{}{}{}", i.width, i.height, if i.fps > 0.0 { format!(" · {} fps", i.fps) } else { String::new() }, if i.rotation != 0 { format!(" · rotated {}°", i.rotation) } else { String::new() }));
                 ui.end_row();
             }
-            if i.has_audio {
+            if i.audio_streams.len() > 1 {
+                lbl(ui, "Sound");
+                ui.vertical(|ui| {
+                    ui.label(format!("{} streams", i.audio_streams.len()));
+                    for (k, s) in i.audio_streams.iter().enumerate() {
+                        ui.label(RichText::new(format!("{}: {}", k + 1, s.describe())).small());
+                    }
+                });
+                ui.end_row();
+            } else if i.has_audio {
                 lbl(ui, "Sound");
                 ui.label(format!("{} ch · {} Hz", i.audio_channels, i.audio_rate));
                 ui.end_row();
@@ -660,13 +669,30 @@ impl Inspector {
             }
             ui.end_row();
             lbl(ui, "Transcript");
+            let streams = m.info.audio_streams.len();
+            // Files with several sound streams: choose the one with the speech.
+            let transcribe_menu = |ui: &mut Ui, text: &str, out: &mut Vec<UiAction>| {
+                ui.menu_button(text, |ui| {
+                    for (k, s) in m.info.audio_streams.iter().enumerate() {
+                        let speech = if k as u32 == m.info.speech_stream() { "  (speech)" } else { "" };
+                        if ui.button(format!("Stream {}: {}{speech}", k + 1, s.describe())).clicked() {
+                            out.push(UiAction::TranscribeStream(m.id.clone(), k as u32));
+                            ui.close();
+                        }
+                    }
+                });
+            };
             ui.horizontal(|ui| match p.transcripts.get(&m.id) {
                 Some(t) => {
-                    ui.label(format!("{} words{}", t.words.len(), if t.language.is_empty() { String::new() } else { format!(" · {}", t.language) }));
-                    if ui.small_button("Re-transcribe").clicked() {
+                    let of = if streams > 1 { format!(" · stream {}", t.stream + 1) } else { String::new() };
+                    ui.label(format!("{} words{}{of}", t.words.len(), if t.language.is_empty() { String::new() } else { format!(" · {}", t.language) }));
+                    if streams > 1 {
+                        transcribe_menu(ui, "Re-transcribe", out);
+                    } else if ui.small_button("Re-transcribe").clicked() {
                         out.push(UiAction::Transcribe(m.id.clone()));
                     }
                 }
+                None if streams > 1 => transcribe_menu(ui, "Transcribe", out),
                 None if m.info.has_audio || m.kind == MediaKind::Audio => {
                     if ui.button("Transcribe").on_hover_text("Run Whisper for word timings (text-based editing, captions, word anchors)").clicked() {
                         out.push(UiAction::Transcribe(m.id.clone()));
@@ -1056,7 +1082,7 @@ mod tests {
         p.media[0].path = format!("C:/Users/someone/Videos/Projects/2026/{long}/{long}.mp4");
         p.tracks[1].name = long.into();
         let word = "Supercalifragilisticexpialidociously";
-        p.transcripts.insert("ma".into(), aiframes_core::Transcript { language: "en".into(), words: (0..40).map(|i| aiframes_core::Word { text: format!(" {word}{i}"), start: i as f64 * 0.5, end: i as f64 * 0.5 + 0.4, conf: 1.0 }).collect() });
+        p.transcripts.insert("ma".into(), aiframes_core::Transcript { language: "en".into(), words: (0..40).map(|i| aiframes_core::Word { text: format!(" {word}{i}"), start: i as f64 * 0.5, end: i as f64 * 0.5 + 0.4, conf: 1.0 }).collect(), ..Default::default() });
         for c in p.clips.iter_mut() {
             c.name = format!("{long} {}", c.id);
         }

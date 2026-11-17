@@ -302,37 +302,54 @@ pub(crate) fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// The audio filter chain: mono becomes dual-mono at unity gain (not -3 dB), more channels are
-/// downmixed with ffmpeg's standard matrix; output starts at source time 0.
-fn audio_filter(probed: &Probed, rate: u32, channels: u32) -> String {
+/// downmixed with ffmpeg's standard matrix (`-ac 2`); output starts at source time 0.
+fn audio_filter(in_channels: u32, rate: u32, channels: u32) -> String {
     let mut f = String::new();
-    if channels == 2 && probed.info.audio_channels == 1 {
+    if channels == 2 && in_channels == 1 {
         f.push_str("pan=stereo|c0=c0|c1=c0,");
     }
     f.push_str(&format!("aresample={rate}:async=1:first_pts=0"));
     f
 }
 
-/// The audio of `path` at `rate`: from the disk cache when it is there, else a progressive decode
-/// into it (returns at once; the decode runs in the background).
-pub(crate) fn open_or_start(path: &Path, probed: &Probed, key: &FileKey, rate: u32, dir: &Path) -> Result<AudioData> {
+/// Disk-cache file suffix of sound stream `stream` at `rate` (stream 0 keeps the name earlier
+/// versions used, so their caches stay valid).
+pub(crate) fn cache_suffix(stream: u32, rate: u32) -> String {
+    if stream == 0 {
+        format!("-{rate}.f32")
+    } else {
+        format!("-s{stream}-{rate}.f32")
+    }
+}
+
+/// Sound stream `stream` of `path` at `rate`: from the disk cache when it is there, else a
+/// progressive decode into it (returns at once; the decode runs in the background). Files without
+/// sound read as silence; a stream the file does not have is an error.
+pub(crate) fn open_or_start(path: &Path, probed: &Probed, key: &FileKey, rate: u32, dir: &Path, stream: u32) -> Result<AudioData> {
     if probed.audio_index.is_none() || !probed.info.has_audio {
+        if stream > 0 {
+            return Err(probed.no_stream(path, stream));
+        }
         return Ok(AudioData::silent(path, rate, probed.info.duration));
     }
+    if probed.audio(stream).is_none() {
+        return Err(probed.no_stream(path, stream));
+    }
     ensure_dir(dir)?;
-    let cache = dir.join(cache_name(path, key, &format!("-{rate}.f32")));
+    let cache = dir.join(cache_name(path, key, &cache_suffix(stream, rate)));
     let valid = std::fs::metadata(&cache).map(|m| m.is_file() && m.len() % 8 == 0).unwrap_or(false);
     if valid {
         return AudioData::open_cache(path, &cache, rate);
     }
-    Ok(AudioData::progressive(path, Prog::start(path, probed, rate, &cache)?))
+    Ok(AudioData::progressive(path, Prog::start(path, probed, rate, &cache, stream)?))
 }
 
-/// Streams a file's audio as interleaved f32 (`channels` = 1 or 2) at `rate` to `f` in chunks;
-/// `f` returns false to stop early. Returns the number of frames delivered. Files without audio
-/// deliver nothing.
-pub(crate) fn stream_pcm(path: &Path, probed: &Probed, rate: u32, channels: u32, mut f: impl FnMut(&[f32]) -> bool) -> Result<u64> {
+/// Streams sound stream `stream` of a file as interleaved f32 (`channels` = 1 or 2) at `rate` to
+/// `f` in chunks; `f` returns false to stop early. Returns the number of frames delivered. Files
+/// without audio deliver nothing.
+pub(crate) fn stream_pcm(path: &Path, probed: &Probed, stream: u32, rate: u32, channels: u32, mut f: impl FnMut(&[f32]) -> bool) -> Result<u64> {
     let mut samples: Vec<f32> = Vec::new();
-    stream_raw(path, probed, rate, channels, 0, Priority::Background, |bytes| {
+    stream_raw(path, probed, stream, rate, channels, 0, Priority::Background, |bytes| {
         samples.clear();
         samples.extend(bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)));
         f(&samples)
@@ -341,16 +358,22 @@ pub(crate) fn stream_pcm(path: &Path, probed: &Probed, rate: u32, channels: u32,
 
 /// Like `stream_pcm` but delivers raw little-endian f32 bytes (always whole frames), starting at
 /// output frame `seek_frames` (0 = the start; sample `k` delivered is then frame `seek_frames + k`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_raw(
     path: &Path,
     probed: &Probed,
+    stream: u32,
     rate: u32,
     channels: u32,
     seek_frames: u64,
     priority: Priority,
     mut f: impl FnMut(&[u8]) -> bool,
 ) -> Result<u64> {
-    let Some(ai) = probed.audio_index.filter(|_| probed.info.has_audio) else { return Ok(0) };
+    if !probed.info.has_audio || probed.audio_streams.is_empty() {
+        return if stream == 0 { Ok(0) } else { Err(probed.no_stream(path, stream)) };
+    }
+    let Some(sa) = probed.audio(stream) else { return Err(probed.no_stream(path, stream)) };
+    let (ai, in_channels) = (sa.index, sa.channels);
     let channels = channels.clamp(1, 2);
     let frame_bytes = 4 * channels as usize;
     let mut c = ffmpeg_at("error", priority)?;
@@ -358,7 +381,7 @@ pub(crate) fn stream_raw(
         c.args(["-ss", &format!("{:.6}", seek_frames as f64 / rate as f64)]);
     }
     c.arg("-i").arg(ff_path(path));
-    c.args(["-map", &format!("0:{ai}"), "-vn", "-sn", "-dn", "-af", &audio_filter(probed, rate, channels)]);
+    c.args(["-map", &format!("0:{ai}"), "-vn", "-sn", "-dn", "-af", &audio_filter(in_channels, rate, channels)]);
     c.args(["-ac", &channels.to_string(), "-c:a", "pcm_f32le", "-f", "f32le", "pipe:1"]);
     c.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = c.spawn().map_err(|e| spawn_error("ffmpeg", e))?;

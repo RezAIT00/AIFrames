@@ -327,6 +327,31 @@ pub(crate) fn matte_mode_label(m: aiframes_core::MatteMode) -> &'static str {
 /// Width the eight speed presets need on one row; narrower panels get two rows of four.
 const SPEED_PRESETS_ONE_ROW: f32 = 300.0;
 
+/// The "Stream" row for a clip of a file with several sound streams (OBS game/mic/chat tracks, a
+/// camera's two mics): which stream the clip plays.
+fn stream_picker(ui: &mut Ui, p: &Project, c: &Clip) -> Option<Op> {
+    let n = util::stream_count(p, c);
+    let (Source::Media { stream, .. }, Some(m)) = (&c.source, util::asset_of(p, c)) else { return None };
+    if n <= 1 && *stream == 0 {
+        return None;
+    }
+    let label = |k: u32| match m.info.audio_stream(k) {
+        Some(s) => format!("{}: {}", k + 1, s.describe()),
+        None => format!("{}: not in the file", k + 1),
+    };
+    lbl(ui, "Stream").on_hover_text("Which sound stream of the file this clip plays (OBS audio tracks, a camera's mics). Each stream can have its own clip: right-click the video clip → Detach audio.");
+    let mut picked = None;
+    ComboBox::from_id_salt(("stream", &c.id)).width(fitw(ui, 170.0)).truncate().selected_text(label(*stream)).show_ui(ui, |ui| {
+        for k in 0..n.max(*stream as usize + 1) as u32 {
+            if ui.selectable_label(*stream == k, label(k)).clicked() && *stream != k {
+                picked = Some(Op::SetAudioStream { clip: c.id.clone(), stream: k });
+            }
+        }
+    });
+    ui.end_row();
+    picked
+}
+
 fn patch(clip: &str, v: serde_json::Value) -> Op {
     Op::SetClip { clip: clip.into(), patch: v }
 }
@@ -660,6 +685,9 @@ impl Inspector {
                         ops.push(("Mute".into(), patch(&c.id, json!({"muted": m}))));
                     }
                     ui.end_row();
+                    if let Some(op) = stream_picker(ui, p, c) {
+                        ops.push(("Audio stream".into(), op));
+                    }
                 }
             });
         });
@@ -1397,7 +1425,7 @@ mod tests {
         let mut p = demo();
         p.clips.push(text("t1", "v2", Time::At(12.0), 2.0));
         p.markers.push(Marker { id: "mk1".into(), time: Time::At(11.0), name: "beat".into(), kind: MarkerKind::Marker, color: None, note: String::new() });
-        p.transcripts.insert("ma".into(), Transcript { language: "en".into(), words: (0..30).map(|i| Word { text: format!(" w{i}"), start: i as f64 * 0.5, end: i as f64 * 0.5 + 0.4, conf: 1.0 }).collect() });
+        p.transcripts.insert("ma".into(), Transcript { language: "en".into(), words: (0..30).map(|i| Word { text: format!(" w{i}"), start: i as f64 * 0.5, end: i as f64 * 0.5 + 0.4, conf: 1.0 }).collect(), ..Default::default() });
         let r = resolve(&p);
         for kind in AnchorKind::ALL {
             let Some(t) = anchor_keeping_place(&p, &r, "t1", kind, None) else { panic!("{kind:?}: no candidate") };
@@ -1426,7 +1454,7 @@ mod tests {
         // Round 4: WordRef.text is filled when the inspector makes a word anchor (start or end).
         let mut p = demo();
         p.clips.push(text("t1", "v2", Time::At(12.0), 2.0));
-        p.transcripts.insert("ma".into(), Transcript { language: "en".into(), words: (0..30).map(|i| Word { text: format!(" w{i}"), start: i as f64 * 0.5, end: i as f64 * 0.5 + 0.4, conf: 1.0 }).collect() });
+        p.transcripts.insert("ma".into(), Transcript { language: "en".into(), words: (0..30).map(|i| Word { text: format!(" w{i}"), start: i as f64 * 0.5, end: i as f64 * 0.5 + 0.4, conf: 1.0 }).collect(), ..Default::default() });
         let r = resolve(&p);
         let t = anchor_keeping_place(&p, &r, "t1", AnchorKind::Word, None).unwrap();
         assert!(matches!(&t, Time::Anchored(Anchor { to: AnchorTarget::Word(w), .. }) if w.text.as_deref() == Some("w24")), "{t:?}");

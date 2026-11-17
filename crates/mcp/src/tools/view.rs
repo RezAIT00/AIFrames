@@ -642,8 +642,23 @@ pub(crate) fn media_info(s: &Arc<Services>, args: &J) -> ToolResult {
             let path = g.doc.media_path(m);
             let users: Vec<&str> = p.clips.iter().filter(|c| matches!(&c.source, Source::Media { asset, .. } if asset == a)).map(|c| c.id.as_str()).collect();
             let mut j = json!({"asset": a, "file": path.to_string_lossy(), "kind": m.kind, "info": m.info, "used_by": users, "offline": !path.exists()});
+            streams_j(&mut j, &m.info);
+            if m.info.audio_stream_count() > 1 {
+                let plays: Vec<J> = p
+                    .clips
+                    .iter()
+                    .filter_map(|c| match &c.source {
+                        Source::Media { asset, stream, .. } if asset == a => Some(json!({"clip": c.id, "stream": stream, "muted": c.muted})),
+                        _ => None,
+                    })
+                    .collect();
+                j["clip_streams"] = J::Array(plays);
+            }
             if let Some(t) = p.transcripts.get(a) {
                 j["transcript_words"] = json!(t.words.len());
+                if m.info.audio_stream_count() > 1 {
+                    j["transcript_stream"] = json!(t.stream);
+                }
             } else if let Some((sc, imp)) = crate::transcripts::find_sidecar(&path) {
                 j["sidecar"] = json!({"file": sc.to_string_lossy(), "format": imp.format, "words": imp.transcript.words.len(), "next": "import_transcript stores it as the transcript"});
             }
@@ -658,6 +673,7 @@ pub(crate) fn media_info(s: &Arc<Services>, args: &J) -> ToolResult {
             let path = abs_path(f, Some(&base));
             let (kind, info) = s.pool.probe(&path).map_err(|e| e.to_string())?;
             let mut j = json!({"file": path.to_string_lossy(), "kind": kind, "info": info});
+            streams_j(&mut j, &info);
             if let Some((sc, imp)) = crate::transcripts::find_sidecar(&path) {
                 j["sidecar"] = json!({"file": sc.to_string_lossy(), "format": imp.format, "words": imp.transcript.words.len(), "note": "import_media imports it as the transcript"});
             }
@@ -666,6 +682,21 @@ pub(crate) fn media_info(s: &Arc<Services>, args: &J) -> ToolResult {
         }
         (Some(_), Some(_)) => Err("pass 'asset' or 'file', not both".into()),
         (None, None) => Err("pass 'asset' (a media id from list_media) or 'file' (a media file path)".into()),
+    }
+}
+
+/// `audio_streams` (index, channels, rate, title, language, label) and a hint for files with several.
+fn streams_j(j: &mut J, info: &aiframes_core::MediaInfo) {
+    if info.audio_stream_count() == 0 {
+        return;
+    }
+    j["audio_streams"] = aiframes_core::describe::audio_streams_json(info);
+    if info.audio_stream_count() > 1 {
+        j["streams_note"] = json!(format!(
+            "{} sound streams. Placing the file (import_media place:\"append\", or add_clip then detach_streams) gives each its own linked audio clip on its own track; set_audio_stream picks the stream of one clip; transcribe/detect_silence/analyze_audio take stream (speech stream by default: {}).",
+            info.audio_stream_count(),
+            info.speech_stream()
+        ));
     }
 }
 

@@ -74,6 +74,7 @@ pub static CODES: &[(&str, Severity, &str)] = &[
     ("empty_track", Severity::Info, "A track has no clips."),
     ("past_fixed_duration", Severity::Warning, "A clip ends after the project's fixed duration."),
     ("no_audio_stream", Severity::Info, "An audio clip plays media without an audio stream (silence)."),
+    ("missing_audio_stream", Severity::Error, "A clip plays a sound stream its file does not have (source.stream past media_info.audio_streams)."),
     ("chapter_markers", Severity::Warning, "Chapter markers break YouTube's rules (first at 0:00, at least 3, 10 s apart)."),
     ("solo_active", Severity::Info, "A track is soloed, so other tracks are silent."),
     ("unknown_transcript_asset", Severity::Info, "A transcript belongs to a media id that does not exist."),
@@ -327,6 +328,19 @@ fn clip_checks(v: &mut V, c: &Clip, tracks: &HashMap<&str, &Track>, media: &Hash
         }
     }
     // Media.
+    if let (Source::Media { stream, .. }, Some(a)) = (&c.source, asset) {
+        if let Some(why) = crate::ops::prims::stream_problem(a, *stream) {
+            v.push(
+                Severity::Error,
+                "missing_audio_stream",
+                format!("{id}: {why}"),
+                at,
+                vec![id.clone()],
+                Some("pick an existing stream (set_audio_stream) or re-import the file to refresh its info.".into()),
+                vec![Op::SetAudioStream { clip: id.clone(), stream: 0 }],
+            );
+        }
+    }
     if let Source::Media { asset: aid, .. } = &c.source {
         if asset.is_none() {
             v.push(
@@ -1469,11 +1483,11 @@ mod tests {
         assert!((q.clips[1].duration - 110.0).abs() < 1e-6);
 
         let mut p = clean();
-        p.clips[0].source = Source::Media { asset: "mv".into(), in_point: -2.0 };
+        p.clips[0].source = Source::Media { asset: "mv".into(), in_point: -2.0, stream: 0 };
         fixes(&p, "clip_before_media_start");
 
         let mut p = clean();
-        p.clips[0].source = Source::Media { asset: "zz".into(), in_point: 0.0 };
+        p.clips[0].source = Source::Media { asset: "zz".into(), in_point: 0.0, stream: 0 };
         assert!(codes(&p).contains(&"missing_media"));
 
         let mut p = clean();
@@ -1586,7 +1600,7 @@ mod tests {
         p.transitions.push(tr("tr1", "c1", "c2", "crossfade", 6.0));
         fixes(&p, "transition_too_long");
         let mut p = clean();
-        p.clips[1].source = Source::Media { asset: "mv".into(), in_point: 0.0 }; // no handle before c2
+        p.clips[1].source = Source::Media { asset: "mv".into(), in_point: 0.0, stream: 0 }; // no handle before c2
         p.transitions.push(tr("tr1", "c1", "c2", "crossfade", 1.0));
         let f = find(&p, "transition_too_long");
         assert!(f.message.contains("held"), "{}", f.message);

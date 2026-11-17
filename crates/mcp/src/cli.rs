@@ -27,7 +27,7 @@ Usage:
   aiframes mcp                          MCP server over stdio (proxies to a running window)
 
   aiframes new <path.aifr> [--preset youtube|4k|720p|shorts|square] [--name N] [--fps F] [--force]
-  aiframes import <project> <files or folders...> [--append] [--track T] [--transcribe] [--language L]
+  aiframes import <project> <files or folders...> [--append] [--track T] [--streams all|first|1,2] [--transcribe] [--language L]
   aiframes describe <project> [--from S --to S] [--json]
   aiframes timeline <project> [--json]
   aiframes validate <project> [--fix] [--severity error|warning|info] [--json]   (exit 1 if errors remain)
@@ -36,7 +36,7 @@ Usage:
   aiframes contact-sheet <project> [--every 5 | --count 12] [--cols 4] [--width 320] [-o out.png]
   aiframes render <project> [-o out.mp4] [--preset youtube|1080p|4k|shorts|square|hevc|draft|prores|gif|wav] [--codec C]
                   [--quality Q] [--range a,b] [--size WxH] [--fit contain|cover] [--no-loudness] [--no-hw] [--force]
-  aiframes transcribe <project> <asset or clip> [--language L] [--model turbo]
+  aiframes transcribe <project> <asset or clip> [--language L] [--model turbo] [--stream N]
   aiframes chapters <project>           YouTube chapter list from chapter markers
   aiframes history <project> [--limit N]
   aiframes ops                          every edit op with an example
@@ -50,7 +50,7 @@ edits stay unsaved there unless --save is given) so the window never overwrites 
 
 const VALUE_FLAGS: &[&str] = &[
     "preset", "name", "fps", "width", "height", "author", "label", "at", "o", "out", "output", "scale", "every", "count", "cols", "codec", "quality", "range",
-    "language", "model", "prompt", "from", "to", "track", "severity", "limit", "size", "fit", "base-revision",
+    "language", "model", "prompt", "from", "to", "track", "severity", "limit", "size", "fit", "base-revision", "stream", "streams",
 ];
 
 struct Args {
@@ -344,6 +344,18 @@ fn cmd_new(e: &Env, a: &Args, out: &mut dyn Write) -> Res {
     Ok(0)
 }
 
+/// `--streams all|first|1,2` as the import_media `streams` argument.
+fn stream_list(v: &str) -> Result<serde_json::Value, Fail> {
+    match v.trim() {
+        "all" | "first" => Ok(json!(v.trim())),
+        list => list
+            .split(',')
+            .map(|x| x.trim().parse::<u32>().map_err(|_| Fail::Usage(format!("--streams takes all, first or stream numbers like 1,2 (got {v:?})"))))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|l| json!(l)),
+    }
+}
+
 fn cmd_import(e: &Env, a: &Args, out: &mut dyn Write, err: &mut dyn Write) -> Res {
     if a.pos.len() < 2 {
         return Err(Fail::Usage("usage: aiframes import <project> <files or folders...>".into()));
@@ -354,6 +366,9 @@ fn cmd_import(e: &Env, a: &Args, out: &mut dyn Write, err: &mut dyn Write) -> Re
         if let Some(v) = a.val(k) {
             args[k] = json!(v);
         }
+    }
+    if let Some(v) = a.val("streams") {
+        args["streams"] = stream_list(v)?;
     }
     let r = e.call("import_media", args)?;
     let mut failed = false;
@@ -623,6 +638,9 @@ fn cmd_transcribe(e: &Env, a: &Args, out: &mut dyn Write, err: &mut dyn Write) -
         if let Some(v) = a.val(k) {
             args[k] = json!(v);
         }
+    }
+    if let Some(v) = a.val("stream") {
+        args["stream"] = json!(v.trim().parse::<u32>().map_err(|_| Fail::Usage(format!("--stream takes a sound stream number like 1 (got {v:?})")))?);
     }
     let r = e.call("transcribe", args)?;
     let job = r["job"].as_u64().ok_or_else(|| "transcription did not start".to_string())?;

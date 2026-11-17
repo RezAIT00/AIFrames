@@ -98,6 +98,8 @@ struct PState {
 pub(crate) struct Prog {
     source: PathBuf,
     probed: Probed,
+    /// The sound stream decoded (0-based among the file's sound streams).
+    stream: u32,
     rate: u32,
     /// Expected number of frames (from the probed duration) until the decode is done.
     estimate: u64,
@@ -161,7 +163,7 @@ fn clean_stale_parts(dir: &Path) {
 
 impl Prog {
     /// Starts (or joins) the progressive decode of `source` into `cache` (the final cache path).
-    pub(crate) fn start(source: &Path, probed: &Probed, rate: u32, cache: &Path) -> Result<Arc<Prog>> {
+    pub(crate) fn start(source: &Path, probed: &Probed, rate: u32, cache: &Path, stream: u32) -> Result<Arc<Prog>> {
         let mut reg = lock(registry());
         if let Some(p) = reg.get(cache).and_then(Weak::upgrade) {
             return Ok(p);
@@ -183,12 +185,13 @@ impl Prog {
             }
         };
         let file = File::open(&part).map_err(|e| MediaError::io(&part, "open the audio cache file", &e))?;
-        let in_rate = probed.info.audio_rate as u64;
+        let in_rate = probed.audio(stream).map(|a| a.rate).unwrap_or(probed.info.audio_rate) as u64;
         let grid = if seeks_exactly(&probed.format_name) && in_rate > 0 { rate as u64 / gcd(rate as u64, in_rate) } else { 0 };
         let estimate = (probed.info.duration.max(0.0) * rate as f64).round() as u64;
         let prog = Arc::new(Prog {
             source: source.to_path_buf(),
             probed: probed.clone(),
+            stream,
             rate,
             estimate,
             grid,
@@ -473,7 +476,7 @@ fn run_main(prog: Arc<Prog>, mut write: File, part: PathBuf, cache: PathBuf) {
     let mut write_err: Option<std::io::Error> = None;
     // The whole-file decode is background work, unless a reader is already waiting for it.
     let priority = if prog.urgent.load(Ordering::Relaxed) { Priority::Normal } else { Priority::Background };
-    let result = crate::audio::stream_raw(&prog.source, &prog.probed, prog.rate, 2, 0, priority, |bytes| {
+    let result = crate::audio::stream_raw(&prog.source, &prog.probed, prog.stream, prog.rate, 2, 0, priority, |bytes| {
         if let Err(e) = write.write_all(bytes) {
             write_err = Some(e);
             return false;
@@ -523,7 +526,7 @@ fn run_region(prog: Arc<Prog>, id: u64, s0: u64, skip: u64) {
     let ahead = (REGION_AHEAD * rate) as u64;
     let mut samples: Vec<f32> = Vec::new();
     // Regions serve playback that is waiting for them: normal priority.
-    let r = crate::audio::stream_raw(&prog.source, &prog.probed, prog.rate, 2, s0, Priority::Normal, |bytes| {
+    let r = crate::audio::stream_raw(&prog.source, &prog.probed, prog.stream, prog.rate, 2, s0, Priority::Normal, |bytes| {
         let frames = bytes.len() / 8;
         let drop_n = to_skip.min(frames);
         to_skip -= drop_n;

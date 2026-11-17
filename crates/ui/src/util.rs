@@ -304,6 +304,14 @@ pub fn clip_label(p: &Project, c: &Clip) -> String {
 }
 
 /// True when the clip makes sound (audio clips, video clips whose media has audio).
+/// Sound streams of a media clip's file (0 for other clips; 1 for the usual single-stream file).
+pub fn stream_count(p: &Project, c: &Clip) -> usize {
+    match &c.source {
+        Source::Media { asset, .. } => p.media.iter().find(|m| &m.id == asset).filter(|m| m.kind != MediaKind::Image).map(|m| m.info.audio_stream_count()).unwrap_or(0),
+        _ => 0,
+    }
+}
+
 pub fn has_sound(p: &Project, c: &Clip) -> bool {
     match asset_of(p, c) {
         Some(a) => a.kind == MediaKind::Audio || (a.kind == MediaKind::Video && (a.info.has_audio || a.info.duration <= 0.0)),

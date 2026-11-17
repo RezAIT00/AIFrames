@@ -114,6 +114,23 @@ fn matte_mode_name(m: MatteMode) -> &'static str {
     }
 }
 
+/// `stream 1/3 "Mic"` for a clip of a file with several sound streams (or one naming a stream other
+/// than the first); `None` for the usual single-stream file.
+fn stream_text(m: Option<&MediaAsset>, stream: u32) -> Option<String> {
+    let n = m.map(|m| m.info.audio_stream_count()).unwrap_or(0);
+    if n <= 1 && stream == 0 {
+        return None;
+    }
+    let title = m.and_then(|m| m.info.audio_stream(stream)).map(|a| a.title).filter(|t| !t.is_empty());
+    let mut t = if n > 1 { format!("stream {stream}/{n}") } else { format!("stream {stream}") };
+    match title {
+        Some(title) => t.push_str(&format!(" {title:?}")),
+        None if stream as usize >= n.max(1) => t.push_str(" (missing)"),
+        None => {}
+    }
+    Some(t)
+}
+
 /// One clip as a line (without indentation).
 pub fn clip_line(p: &Project, r: &Resolved, c: &Clip, notes: bool) -> String {
     let mut s = match r.span(&c.id) {
@@ -125,12 +142,15 @@ pub fn clip_line(p: &Project, r: &Resolved, c: &Clip, notes: bool) -> String {
     }
     s.push(' ');
     match &c.source {
-        Source::Media { asset, in_point } => {
-            let kind = p.media.iter().find(|m| &m.id == asset).map(|m| m.kind);
-            if kind == Some(MediaKind::Image) {
+        Source::Media { asset, in_point, stream } => {
+            let m = p.media.iter().find(|m| &m.id == asset);
+            if m.map(|m| m.kind) == Some(MediaKind::Image) {
                 s.push_str(&format!("image:{}", media_label(p, asset)));
             } else {
                 s.push_str(&format!("media:{}@{}s", media_label(p, asset), util::num(*in_point)));
+                if let Some(t) = stream_text(m, *stream) {
+                    s.push_str(&format!(" {t}"));
+                }
                 match &c.speed {
                     Param::Value(v) if *v == 1.0 => {}
                     Param::Value(v) if *v == 0.0 => s.push_str(" freeze"),
@@ -350,8 +370,13 @@ pub fn describe_with(p: &Project, r: &Resolved, o: &DescribeOptions) -> String {
             if i.fps > 0.0 {
                 s.push_str(&format!(" {} fps", util::num(i.fps)));
             }
-            if m.kind == MediaKind::Video {
-                s.push_str(if i.has_audio { " +audio" } else { " (no audio)" });
+            if m.kind == MediaKind::Video && !i.has_audio {
+                s.push_str(" (no audio)");
+            } else if i.audio_streams.len() > 1 {
+                let list: Vec<String> = i.audio_streams.iter().enumerate().map(|(k, a)| format!("{k}: {}", a.describe())).collect();
+                s.push_str(&format!(" +{} audio streams [{}]", i.audio_streams.len(), list.join("; ")));
+            } else if m.kind == MediaKind::Video {
+                s.push_str(" +audio");
             }
             if let Some(t) = p.transcripts.get(&m.id) {
                 s.push_str(&format!(", transcript {} words", t.words.len()));
@@ -498,7 +523,7 @@ pub fn describe_with(p: &Project, r: &Resolved, o: &DescribeOptions) -> String {
 
 fn source_json(p: &Project, c: &Clip) -> Value {
     match &c.source {
-        Source::Media { asset, in_point } => {
+        Source::Media { asset, in_point, stream } => {
             let m = p.media.iter().find(|m| &m.id == asset);
             let (lo, hi) = source_span(c).unwrap_or((*in_point, *in_point));
             let mut v = json!({
@@ -515,6 +540,14 @@ fn source_json(p: &Project, c: &Clip) -> Value {
             if c.reverse {
                 v["reverse"] = json!(true);
             }
+            let streams = m.map(|m| m.info.audio_stream_count()).unwrap_or(0);
+            if streams > 1 || *stream > 0 {
+                v["stream"] = json!(stream);
+                v["streams"] = json!(streams);
+                if let Some(t) = m.and_then(|m| m.info.audio_stream(*stream)).map(|a| a.title).filter(|t| !t.is_empty()) {
+                    v["stream_title"] = json!(t);
+                }
+            }
             v
         }
         Source::Text(t) => {
@@ -528,6 +561,21 @@ fn source_json(p: &Project, c: &Clip) -> Value {
         Source::Shape(s) => json!({"type": "shape", "kind": s.kind, "width": s.width, "height": s.height}),
         Source::Adjustment => json!({"type": "adjustment"}),
     }
+}
+
+/// The sound streams of a file for AIs: `[{"index": 0, "channels": 2, "rate": 48000, "title": "Game", ...}]`
+/// (one entry built from `audio_channels`/`audio_rate` for a single-stream file; empty without sound).
+pub fn audio_streams_json(i: &MediaInfo) -> Value {
+    let list: Vec<Value> = (0..i.audio_stream_count() as u32)
+        .filter_map(|k| i.audio_stream(k).map(|a| (k, a)))
+        .map(|(k, a)| {
+            let mut v = serde_json::to_value(&a).unwrap_or_else(|_| json!({}));
+            v["index"] = json!(k);
+            v["label"] = json!(a.describe());
+            v
+        })
+        .collect();
+    Value::Array(list)
 }
 
 /// One clip as timeline JSON.
@@ -632,7 +680,13 @@ pub fn timeline_json(p: &Project, r: &Resolved) -> Value {
     let media: Vec<Value> = p
         .media
         .iter()
-        .map(|m| json!({"id": m.id, "file": util::file_name(&m.path), "path": m.path, "kind": m.kind, "duration": m.info.duration, "has_audio": m.info.has_audio, "transcript_words": p.transcripts.get(&m.id).map(|t| t.words.len())}))
+        .map(|m| {
+            let mut v = json!({"id": m.id, "file": util::file_name(&m.path), "path": m.path, "kind": m.kind, "duration": m.info.duration, "has_audio": m.info.has_audio, "transcript_words": p.transcripts.get(&m.id).map(|t| t.words.len())});
+            if !m.info.audio_streams.is_empty() {
+                v["audio_streams"] = audio_streams_json(&m.info);
+            }
+            v
+        })
         .collect();
     json!({
         "name": p.name,

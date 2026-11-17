@@ -61,7 +61,7 @@ fn chain() -> Project {
 
 #[test]
 fn every_op_has_a_spec_and_a_parseable_example() {
-    assert_eq!(OPS.len(), 58);
+    assert_eq!(OPS.len(), 60);
     let mut names = HashSet::new();
     for spec in OPS {
         assert!(names.insert(spec.name), "duplicate {}", spec.name);
@@ -717,7 +717,7 @@ fn replace_media_lift_extract_nudge() {
     let mut p = chain();
     run(&mut p, json!({"op":"add_media","path":"b.mp4","kind":"video","info":{"duration":5,"has_video":true}}));
     run(&mut p, json!({"op":"replace_media","clip":"c1","asset":"m2","in_point":0.5}));
-    assert_eq!(clip(&p, "c1").source, Source::Media { asset: "m2".into(), in_point: 0.5 });
+    assert_eq!(clip(&p, "c1").source, Source::Media { asset: "m2".into(), in_point: 0.5, stream: 0 });
     assert!(fails(&mut p, json!({"op":"replace_media","clip":"c2","asset":"m2"})).contains("past the end"));
     assert!(fails(&mut p, json!({"op":"replace_media","clip":"t1","asset":"m2"})).contains("not a media clip"));
 
@@ -1269,4 +1269,165 @@ fn ops_scale_to_10k_clips() {
     assert!(el.as_secs_f64() < 20.0, "three ops on 10k clips took {el:?}");
     assert_eq!(o.changed, vec!["c0"]);
     assert!((span(&p, "c9999").end - (100.0 + 0.01 - 0.01)).abs() < 1e-6);
+}
+
+// ------------------------------------------------------------------------------- sound streams
+
+/// `project()` plus `mo`: an OBS recording with game (stereo), mic (mono, titled) and chat streams,
+/// and clip c1 of it on v1 [0–10].
+fn obs() -> Project {
+    let mut p = project();
+    let mut m = asset("mo", "media/obs.mkv", MediaKind::Video, 60.0, true);
+    m.info.audio_channels = 2;
+    m.info.audio_rate = 48_000;
+    m.info.audio_streams = vec![
+        AudioStream { channels: 2, rate: 48_000, codec: "aac".into(), title: "Game".into(), ..Default::default() },
+        AudioStream { channels: 1, rate: 48_000, codec: "aac".into(), title: "Mic".into(), language: "eng".into(), ..Default::default() },
+        AudioStream { channels: 2, rate: 48_000, codec: "aac".into(), title: "Chat".into(), ..Default::default() },
+    ];
+    p.media.push(m);
+    p.clips.push(media_clip("c1", "v1", "mo", Time::At(0.0), 10.0, 5.0));
+    p
+}
+
+fn stream_of(p: &Project, id: &str) -> u32 {
+    match &clip(p, id).source {
+        Source::Media { stream, .. } => *stream,
+        _ => panic!("{id} is not media"),
+    }
+}
+
+#[test]
+fn detach_streams_links_one_clip_per_stream() {
+    let mut p = obs();
+    // a1 and a2 are free over c1: they take the first two streams, a new track named after the third.
+    let o = run(&mut p, json!({"op": "detach_streams", "clip": "c1"}));
+    assert!(clip(&p, "c1").muted, "the video's own sound is muted");
+    let followers = linked_partners(&p, "c1");
+    assert_eq!(followers.len(), 3, "{followers:?} ({})", o.summary);
+    let mut by_stream: Vec<(u32, String, String)> = followers.iter().map(|f| (stream_of(&p, f), clip(&p, f).track.clone(), clip(&p, f).name.clone())).collect();
+    by_stream.sort();
+    assert_eq!(by_stream.iter().map(|x| x.0).collect::<Vec<_>>(), vec![0, 1, 2]);
+    assert_eq!(by_stream[0].1, "a1");
+    assert_eq!(by_stream[1].1, "a2");
+    let t3 = p.tracks.iter().find(|t| t.id == by_stream[2].1).unwrap();
+    assert_eq!((t3.kind, t3.name.as_str()), (TrackKind::Audio, "Chat"), "new track named after its stream");
+    assert_eq!(by_stream[1].2, "Mic", "clips are named after their streams");
+    assert!(o.summary.contains("stream 1 \"Mic\""), "{}", o.summary);
+    for f in &followers {
+        assert_eq!(s(&p, f), (0.0, 10.0));
+        assert!((inp(&p, f) - 5.0).abs() < 1e-9);
+    }
+    // They move, trim and split with the picture.
+    run(&mut p, json!({"op": "move_clip", "clip": "c1", "start": 4.0}));
+    run(&mut p, json!({"op": "trim_clip", "clip": "c1", "edge": "end", "delta": -2.0}));
+    for f in &followers {
+        assert_eq!(s(&p, f), (4.0, 12.0), "{f}");
+    }
+    // Trimming one stream's clip trims the picture and the other streams too.
+    let mic = by_stream[1].0;
+    let mic_id = followers.iter().find(|f| stream_of(&p, f) == mic).unwrap().clone();
+    run(&mut p, json!({"op": "trim_clip", "clip": mic_id, "edge": "start", "delta": 1.0}));
+    for f in followers.iter().chain(std::iter::once(&"c1".to_string())) {
+        assert_eq!(s(&p, f), (5.0, 12.0), "{f} follows a trim of the mic clip");
+    }
+    run(&mut p, json!({"op": "split_clip", "clip": "c1", "at": 8.0}));
+    assert_eq!(p.clips.iter().filter(|c| matches!(&c.source, Source::Media { asset, .. } if asset == "mo")).count(), 8);
+    // Every stream already has its clip.
+    let e = fails(&mut p, json!({"op": "detach_streams", "clip": "c1"}));
+    assert!(e.contains("already has its own clip"), "{e}");
+}
+
+#[test]
+fn detach_streams_options_and_errors() {
+    let mut p = obs();
+    let e = fails(&mut p, json!({"op": "detach_streams", "clip": "c1", "streams": [3]}));
+    assert!(e.contains("3 sound streams (0–2), not stream 3"), "{e}");
+    let e = fails(&mut p, json!({"op": "detach_streams", "clip": "c1", "streams": [1], "tracks": ["v2"]}));
+    assert!(e.contains("video track"), "{e}");
+    let e = fails(&mut p, json!({"op": "detach_streams", "clip": "c1", "streams": [1, 2], "tracks": ["a1"]}));
+    assert!(e.contains("one audio track per stream"), "{e}");
+    run(&mut p, json!({"op": "detach_streams", "clip": "c1", "streams": [1], "tracks": ["a2"], "new_ids": ["mic"]}));
+    assert_eq!((stream_of(&p, "mic"), clip(&p, "mic").track.as_str()), (1, "a2"));
+    let e = fails(&mut p, json!({"op": "detach_streams", "clip": "c1", "streams": [1]}));
+    assert!(e.contains("stream 1 is already detached as mic"), "{e}");
+    // The rest later, with detach_audio for one stream.
+    run(&mut p, json!({"op": "add_track", "id": "a3", "kind": "audio"}));
+    run(&mut p, json!({"op": "detach_audio", "clip": "c1", "track": "a3", "stream": 2, "new_id": "chat"}));
+    assert_eq!(stream_of(&p, "chat"), 2);
+    let e = fails(&mut p, json!({"op": "detach_audio", "clip": "c1", "track": "a1", "stream": 2}));
+    assert!(e.contains("stream 2 is already detached as chat"), "{e}");
+    run(&mut p, json!({"op": "detach_streams", "clip": "c1"}));
+    assert_eq!(linked_partners(&p, "c1").len(), 3);
+    // Not a media clip.
+    p.clips.push(text_clip("t1", "v2", Time::At(0.0), 2.0));
+    assert!(fails(&mut p, json!({"op": "detach_streams", "clip": "t1"})).contains("text clip"));
+}
+
+#[test]
+fn audio_only_multi_stream_files_keep_their_own_stream() {
+    let mut p = obs();
+    let mut a = asset("mp", "media/podcast.mka", MediaKind::Audio, 30.0, true);
+    a.info.audio_streams = vec![AudioStream { channels: 1, title: "Host".into(), ..Default::default() }, AudioStream { channels: 1, title: "Guest".into(), ..Default::default() }];
+    p.media.push(a);
+    p.clips.push(media_clip("pc", "a1", "mp", Time::At(20.0), 5.0, 0.0));
+    run(&mut p, json!({"op": "detach_streams", "clip": "pc"}));
+    assert!(!clip(&p, "pc").muted, "an audio clip keeps playing its own stream");
+    let f = linked_partners(&p, "pc");
+    assert_eq!(f.len(), 1);
+    assert_eq!(stream_of(&p, &f[0]), 1);
+    let e = fails(&mut p, json!({"op": "detach_audio", "clip": "pc", "track": "a2"}));
+    assert!(e.contains("detach_streams"), "detach_audio on an audio clip points at detach_streams: {e}");
+}
+
+#[test]
+fn set_audio_stream_checks_the_file() {
+    let mut p = obs();
+    let o = run(&mut p, json!({"op": "set_audio_stream", "clip": "c1", "stream": 1}));
+    assert_eq!(stream_of(&p, "c1"), 1);
+    assert!(o.summary.contains("Mic"), "{}", o.summary);
+    assert!(fails(&mut p, json!({"op": "set_audio_stream", "clip": "c1", "stream": 5})).contains("3 sound streams (0–2)"));
+    // Single-stream info: only stream 0, with a hint for info stored by older versions.
+    p.clips.push(media_clip("c2", "v1", "mv", Time::At(20.0), 5.0, 0.0));
+    let e = fails(&mut p, json!({"op": "set_audio_stream", "clip": "c2", "stream": 1}));
+    assert!(e.contains("one sound stream") && e.contains("import the file again"), "{e}");
+    // set_clip is checked the same way.
+    let e = fails(&mut p, json!({"op": "set_clip", "clip": "c2", "patch": {"source": {"stream": 2}}}));
+    assert!(e.contains("not stream 2"), "{e}");
+    run(&mut p, json!({"op": "set_clip", "clip": "c1", "patch": {"source": {"stream": 2}}}));
+    assert_eq!(stream_of(&p, "c1"), 2);
+    // A stream past the file's (e.g. after relinking to a file with fewer) is a finding with a fix.
+    p.media.iter_mut().find(|m| m.id == "mo").unwrap().info.audio_streams.clear();
+    let f = crate::validate::validate(&p, &resolve(&p));
+    let found = f.iter().find(|f| f.code == "missing_audio_stream").expect("missing_audio_stream finding");
+    assert_eq!(found.fix_ops, vec![Op::SetAudioStream { clip: "c1".into(), stream: 0 }]);
+}
+
+#[test]
+fn stream_fields_are_backwards_compatible() {
+    // A project written before sound streams existed loads and saves byte for byte.
+    let old = json!({
+        "format": 1,
+        "media": [{"id": "m1", "path": "a.mp4", "kind": "video", "info": {"duration": 20.0, "has_video": true, "has_audio": true, "audio_channels": 2, "audio_rate": 48000}}],
+        "tracks": [{"id": "v1", "kind": "video"}],
+        "clips": [{"id": "c1", "track": "v1", "start": 0.0, "duration": 4.0, "source": {"type": "media", "asset": "m1", "in_point": 2.0}}],
+        "transcripts": {"m1": {"words": [{"text": "hi", "start": 0.1, "end": 0.3}]}}
+    });
+    let p: Project = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(p.clips[0].source, Source::Media { asset: "m1".into(), in_point: 2.0, stream: 0 });
+    assert_eq!(p.media[0].info.audio_stream_count(), 1);
+    assert_eq!(p.transcripts["m1"].stream, 0);
+    let back = serde_json::to_value(&p).unwrap();
+    for k in ["media", "clips", "transcripts"] {
+        assert_eq!(back[k], old[k], "{k} unchanged");
+    }
+    // The new fields round-trip and are omitted at their defaults.
+    let mut q = obs();
+    run(&mut q, json!({"op": "set_audio_stream", "clip": "c1", "stream": 2}));
+    let v = serde_json::to_value(&q).unwrap();
+    let c1 = v["clips"].as_array().unwrap().iter().find(|c| c["id"] == "c1").unwrap();
+    assert_eq!(c1["source"]["stream"], json!(2));
+    let r: Project = serde_json::from_value(v).unwrap();
+    assert_eq!(r, q);
+    assert_eq!(q.media.iter().find(|m| m.id == "mo").unwrap().info.speech_stream(), 1, "the stream titled Mic");
 }

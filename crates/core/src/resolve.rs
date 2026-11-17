@@ -829,7 +829,7 @@ mod tests {
         // Word cut out: in_point past it.
         p.clips[0].reverse = false;
         p.clips[0].speed = Param::Value(1.0);
-        p.clips[0].source = Source::Media { asset: "m1".into(), in_point: 3.2 };
+        p.clips[0].source = Source::Media { asset: "m1".into(), in_point: 3.2, stream: 0 };
         let r = resolve(&p);
         assert_eq!(r.error_for("t1").unwrap().kind, ResolveErrorKind::WordCutOut);
         assert_eq!(r.error_for("t1").unwrap().code(), "word_cut_out");

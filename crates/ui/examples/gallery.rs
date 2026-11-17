@@ -165,7 +165,7 @@ fn transcript() -> Transcript {
             t += if sentence % 2 == 0 { 1.6 } else { 0.55 };
         }
     }
-    Transcript { language: "en".into(), words }
+    Transcript { language: "en".into(), words, ..Default::default() }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -185,6 +185,7 @@ fn media_op(id: &str, path: &str, kind: MediaKind, duration: f64, w: u32, h: u32
             audio_rate: if audio { 48_000 } else { 0 },
             codec: if kind == MediaKind::Video { "h264".into() } else if kind == MediaKind::Audio { "aac".into() } else { "png".into() },
             rotation: 0,
+            ..Default::default()
         },
         name: Some(name.into()),
         notes: Some(notes.into()),
@@ -277,7 +278,7 @@ fn demo() -> (Document, Vec<Id>) {
         panic!("demo project: {e}");
     }
     // Detached audio of the boss fight onto the SFX track would overlap the whoosh; use a new track.
-    apply_batch(&mut p, &[Op::AddTrack { id: Some("a4".into()), kind: TrackKind::Audio, name: Some("Game audio".into()), role: Some("sfx".into()), index: None }, Op::DetachAudio { clip: "c4".into(), track: "a4".into(), new_id: Some("c4a".into()) }]).expect("detach");
+    apply_batch(&mut p, &[Op::AddTrack { id: Some("a4".into()), kind: TrackKind::Audio, name: Some("Game audio".into()), role: Some("sfx".into()), index: None }, Op::DetachAudio { clip: "c4".into(), track: "a4".into(), stream: None, new_id: Some("c4a".into()) }]).expect("detach");
     // Captions (word-anchored karaoke) as the AI would make them.
     let mut doc = Document::new(p);
     doc.apply("ai", "Generate captions", vec![Op::GenerateCaptions { clips: vec!["vo1".into()], track: "v4".into(), style: None, max_words: Some(4), max_chars: None, pause: None, replace: false }]).expect("captions");
@@ -490,7 +491,7 @@ impl Gallery {
                 UiAction::SetIn(t) => self.in_point = t,
                 UiAction::SetOut(t) => self.out_point = t,
                 UiAction::Import(_) => self.status = "Import: the app shell opens a file dialog here.".into(),
-                UiAction::Transcribe(id) => {
+                UiAction::Transcribe(id) | UiAction::TranscribeStream(id, _) => {
                     self.status = format!("Transcribe {id}: the app runs Whisper and applies set_transcript.");
                 }
                 UiAction::Status(s) => self.status = s,

@@ -33,13 +33,13 @@ mod transcribe;
 mod util;
 mod waveform;
 
-pub use analysis::{analyze_beats, beats_of_pcm, detect_beats, detect_scenes, detect_silence, silence_of_pcm, Beats};
+pub use analysis::{analyze_beats, beats_of_pcm, detect_beats, detect_scenes, detect_silence, detect_silence_stream, silence_of_pcm, Beats};
 pub use audio::{write_wav, AudioData, WavFormat, WavWriter};
 pub use decode::HwAccel;
 pub use encode::{bitrate_cap_mbps, EncodeOptions, Encoder, Quality, VideoCodec};
 pub use error::MediaError;
 pub use joins::{classify, cut_edges, edge_level, ends_sentence, is_punctuated, quiet_before, level_db, quiet_run, room_floor, CutEdges, Edge, LevelClass, MIN_PAUSE, SPEECH_ABOVE_FLOOR};
-pub use loudness::{loudness_of_file, loudness_of_pcm, Loudness, LoudnessMeter};
+pub use loudness::{loudness_of_file, loudness_of_file_stream, loudness_of_pcm, Loudness, LoudnessMeter};
 pub use pool::{Frame, FrameCaching, MediaPool, PoolStats, DEFAULT_READAHEAD_BYTES};
 pub use probe::probe;
 pub use tools::{tools, Tools};

@@ -143,7 +143,9 @@ overlaps) and returns a clear error naming the problem and how to fix it.
   (paths: `opacity`, `volume`, `speed`, `transform.x|y|scale|rotation`, `transform.crop.left|...`, `effects.N.<param>`, `source.draw`),
   `add_keyframe {clip, path, t, v, ease?}`, `remove_keyframe {clip, path, t}`, `slip_clip {clip, delta}` (moves in_point only),
   `roll_edit {left, right, delta}`, `slide_clip {clip, delta}`, `set_speed {clip, speed, keep: "duration"|"source"}`, `freeze_frame {clip, at, duration}`,
-  `detach_audio {clip, track}` (creates an audio clip anchored `with` the video clip and mutes the video's sound),
+  `detach_audio {clip, track, stream?}` (creates an audio clip anchored `with` the video clip and mutes the video's sound),
+  `detach_streams {clip, streams?, tracks?, new_ids?}` (one linked audio clip per sound stream of the file, each on its own
+  audio track — what placing an OBS recording does), `set_audio_stream {clip, stream}`,
   `replace_media {clip, asset, in_point?}`, `lift_range {from, to, tracks?}` and `extract_range {from, to, tracks?}` (ripple),
   `nudge {clips, delta}`
 - Effects: `add_effect {clip, effect, index?}`, `remove_effect {clip, index}`, `set_effect {clip, index, enabled?, params?, colors?, strings?}`, `move_effect`
@@ -153,6 +155,16 @@ overlaps) and returns a clear error naming the problem and how to fix it.
 - Transcript: `set_transcript {asset, transcript}`, `delete_words {clip, from, to}` (text-based editing: removes those words' source
   range from the clip by splitting and ripple-deleting, keeping a small configurable pad), `generate_captions {clips, track, style?, max_words?, max_chars?}`
   (creates text clips anchored to words so captions follow the voice; karaoke `highlight` filled in)
+
+**Sound streams.** `MediaInfo::audio_streams` lists every sound stream of a file that has more than one
+(channels, rate, codec, layout, language, title; empty = one stream, described by `audio_channels`/`audio_rate`).
+`Source::Media::stream` (default 0 = the first) says which stream a clip plays and `Transcript::stream` which one the
+words came from. Placing such a file (GUI drop/add/append, `import_media place:"append"`) adds the picture clip plus one
+linked audio clip per stream on its own audio track (`detach_streams`); the links are the usual `detach_audio` links
+(anchored `with` the leader, same media/in-point/length/speed), so the streams trim, split, slip and move with the
+picture, and each has its own mute and volume. The mixer and export mix every stream in use; the inspector's Stream row
+and `set_audio_stream` switch a clip's stream; ops refuse a stream the file does not have and `validate` reports
+`missing_audio_stream`. Info probed by earlier versions lists no streams: importing the file again refreshes it.
 
 ## Media API (aiframes-media)
 
@@ -168,6 +180,9 @@ impl MediaPool {
     pub fn image(&self, path: &Path, max: Option<(u32, u32)>) -> Result<Frame, MediaError>;
     pub fn audio(&self, path: &Path, rate: u32) -> Result<Arc<AudioData>, MediaError>;   // decoded once to a disk cache, stereo f32
     pub fn waveform(&self, path: &Path) -> Result<Arc<Waveform>, MediaError>;            // min/max peaks, ~200 bins/s
+    // Files with several sound streams (OBS game/mic/chat, a camera's two mics): `audio`/`waveform` are stream 0;
+    // `audio_stream(path, rate, k)`, `audio_complete_stream`, `prefetch_audio_stream`, `waveform_stream(path, k)` read
+    // stream k (0-based among the sound streams), each with its own caches. Mono plays on both sides, 5.1 is downmixed.
     pub fn thumbnail(&self, path: &Path, t: f64, height: u32) -> Result<Frame, MediaError>;
 }
 impl AudioData { pub fn rate(&self) -> u32; pub fn duration(&self) -> f64; pub fn read(&self, start_sec: f64, out: &mut [f32]) /* stereo interleaved, zeros outside */ }
@@ -176,7 +191,8 @@ pub fn detect_silence(path: &Path, noise_db: f64, min_len: f64) -> Result<Vec<[f
 pub fn detect_beats(path: &Path) -> Result<Vec<f64>, MediaError>;
 pub struct Loudness { pub integrated_lufs: f64, pub true_peak_db: f64, pub lra: f64, pub max_momentary_lufs: f64 }
 pub fn loudness_of_pcm(stereo: &[f32], rate: u32) -> Loudness;   pub fn loudness_of_file(path: &Path) -> Result<Loudness, MediaError>;
-pub fn transcribe(path: &Path, opts: &TranscribeOptions) -> Result<Transcript, MediaError>;   // word timestamps; progress callback
+pub fn transcribe(path: &Path, opts: &TranscribeOptions) -> Result<Transcript, MediaError>;   // word timestamps; progress callback;
+                                                                                              // opts.stream (default: MediaInfo::speech_stream)
 pub struct Encoder;  // ffmpeg child: raw RGBA frames on stdin + an audio WAV -> mp4/mov/gif; NVENC when asked and available
 impl Encoder { pub fn start(opts: &EncodeOptions) -> Result<Self, MediaError>; pub fn push(&mut self, rgba: &[u8]) -> Result<(), MediaError>; pub fn finish(self) -> Result<(), MediaError> }
 ```

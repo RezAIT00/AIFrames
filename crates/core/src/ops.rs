@@ -409,11 +409,35 @@ pub enum Op {
     },
     /// Creates an audio clip of the video clip's sound on an audio track, anchored `with` the video
     /// clip (linked: splits/trims/deletes of the video follow), and mutes the video clip's own sound.
+    /// `stream` picks which sound stream of the file it plays (default: the stream the video clip
+    /// played); detaching another stream of an already detached clip adds another linked clip.
     DetachAudio {
         clip: Id,
         track: Id,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         new_id: Option<Id>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream: Option<u32>,
+    },
+    /// Gives each sound stream of a clip's file its own linked audio clip, each on its own audio
+    /// track (what dropping an OBS recording with game, mic and chat streams does): `streams`
+    /// (default: every stream not detached yet), `tracks` (one per stream; default: free unlocked
+    /// audio tracks over the clip, new ones are added and named after the streams when there are
+    /// not enough). A video clip's own sound is muted; an audio clip keeps playing its own stream
+    /// and gets the others as linked clips. `new_ids` names the clips.
+    DetachStreams {
+        clip: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        streams: Option<Vec<u32>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tracks: Option<Vec<Id>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_ids: Option<Vec<Id>>,
+    },
+    /// Chooses which sound stream of its file a media clip plays (0 = the first).
+    SetAudioStream {
+        clip: Id,
+        stream: u32,
     },
     ReplaceMedia {
         clip: Id,
@@ -717,7 +741,14 @@ pub static OPS: &[OpSpec] = &[
     spec("slide_clip", "clips", "Moves a clip between its neighbours, which absorb the change.", r#"{"op":"slide_clip","clip":"c4","delta":-0.5}"#),
     spec("set_speed", "clips", "Constant playback speed; keep \"source\" (duration changes) or \"duration\".", r#"{"op":"set_speed","clip":"c3","speed":2,"keep":"source"}"#),
     spec("freeze_frame", "clips", "Holds the frame at a timeline time for a duration, pushing the rest later.", r#"{"op":"freeze_frame","clip":"c3","at":15.0,"duration":1.5}"#),
-    spec("detach_audio", "clips", "Moves a video clip's sound to a linked audio clip on an audio track.", r#"{"op":"detach_audio","clip":"c3","track":"a1"}"#),
+    spec("detach_audio", "clips", "Moves a video clip's sound to a linked audio clip on an audio track. `stream` picks which sound stream of the file it plays (default: the clip's own; media_info lists them).", r#"{"op":"detach_audio","clip":"c3","track":"a1","stream":1}"#),
+    spec(
+        "detach_streams",
+        "clips",
+        "Gives each sound stream of the clip's file (OBS game/mic/chat, a camera's two mics) its own linked audio clip on its own audio track, like Premiere/Resolve on import. Options: streams (default all not yet detached), tracks (one per stream; default free audio tracks, new ones named after the streams), new_ids. Video sound is muted; linked clips trim/split/move with the video and each has its own mute and volume.",
+        r#"{"op":"detach_streams","clip":"c3"}"#,
+    ),
+    spec("set_audio_stream", "clips", "Chooses which sound stream of its file a media clip plays (0 = first; media_info / list_media list the streams).", r#"{"op":"set_audio_stream","clip":"c7","stream":2}"#),
     spec("replace_media", "clips", "Swaps the media of a clip, keeping its timing and effects.", r#"{"op":"replace_media","clip":"c3","asset":"m4","in_point":2.0}"#),
     spec("lift_range", "clips", "Removes everything in [from, to) on tracks, leaving a gap.", r#"{"op":"lift_range","from":10.0,"to":12.5,"tracks":["v1","a1"]}"#),
     spec("extract_range", "clips", "Removes [from, to) on tracks and closes the gap.", r#"{"op":"extract_range","from":10.0,"to":12.5}"#),
@@ -787,6 +818,8 @@ impl Op {
             Op::SetSpeed { .. } => "set_speed",
             Op::FreezeFrame { .. } => "freeze_frame",
             Op::DetachAudio { .. } => "detach_audio",
+            Op::DetachStreams { .. } => "detach_streams",
+            Op::SetAudioStream { .. } => "set_audio_stream",
             Op::ReplaceMedia { .. } => "replace_media",
             Op::LiftRange { .. } => "lift_range",
             Op::ExtractRange { .. } => "extract_range",

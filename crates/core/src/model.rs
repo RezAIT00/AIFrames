@@ -232,6 +232,101 @@ pub struct MediaInfo {
     /// Display rotation in degrees from container metadata (0/90/180/270).
     #[serde(default, skip_serializing_if = "is_default")]
     pub rotation: i32,
+    /// Every sound stream of the file, in file order, when it has more than one (OBS recordings
+    /// with game, mic and chat on separate tracks; cameras with two mics). Empty = at most one
+    /// stream, described by `audio_channels` / `audio_rate` (which always describe stream 0).
+    /// A clip picks its stream with `Source::Media::stream`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio_streams: Vec<AudioStream>,
+}
+
+impl MediaInfo {
+    /// How many sound streams the file has (0 without sound).
+    pub fn audio_stream_count(&self) -> usize {
+        if self.audio_streams.is_empty() {
+            usize::from(self.has_audio)
+        } else {
+            self.audio_streams.len()
+        }
+    }
+
+    /// Description of sound stream `index` (0-based among the sound streams), if it exists. A file
+    /// with a single stream gets one built from `audio_channels` / `audio_rate`.
+    pub fn audio_stream(&self, index: u32) -> Option<AudioStream> {
+        if let Some(s) = self.audio_streams.get(index as usize) {
+            return Some(s.clone());
+        }
+        (self.audio_streams.is_empty() && self.has_audio && index == 0).then(|| AudioStream {
+            channels: self.audio_channels,
+            rate: self.audio_rate,
+            ..Default::default()
+        })
+    }
+
+    /// The stream most likely to hold the speech, for transcription and word-cut measuring: the
+    /// first whose title names a voice ("Mic", "Voice", "Commentary", "Narration", "VO", ...), else
+    /// the first stream.
+    pub fn speech_stream(&self) -> u32 {
+        const VOICE: &[&str] = &["mic", "voice", "commentary", "narrat", "speech", "dialog", "vo", "talk", "host", "speaker"];
+        let voice = |t: &str| {
+            let l = t.to_ascii_lowercase();
+            l.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| VOICE.iter().any(|v| if v.len() <= 3 { w == *v } else { w.starts_with(v) }))
+        };
+        self.audio_streams.iter().position(|s| voice(&s.title)).map(|i| i as u32).unwrap_or(0)
+    }
+}
+
+/// One sound stream of a media file (see [`MediaInfo::audio_streams`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AudioStream {
+    /// Channels (1 = mono, plays on both sides; more than 2 are downmixed to stereo).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub channels: u32,
+    /// Sample rate in Hz.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub rate: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub codec: String,
+    /// Channel layout as ffmpeg names it ("stereo", "mono", "5.1(side)").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub layout: String,
+    /// Language tag ("eng"), empty when the file does not say.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub language: String,
+    /// The stream's title in the file ("Mic", "Discord"), empty when it has none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+}
+
+impl AudioStream {
+    /// "mono", "stereo", "5.1(side)" or "N ch".
+    pub fn channels_label(&self) -> String {
+        match (self.layout.as_str(), self.channels) {
+            (l, _) if !l.is_empty() && l != "unknown" => l.to_string(),
+            (_, 1) => "mono".into(),
+            (_, 2) => "stereo".into(),
+            (_, 0) => "? ch".into(),
+            (_, n) => format!("{n} ch"),
+        }
+    }
+
+    /// Short human description: `Mic · mono · 48 kHz · eng`.
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.title.is_empty() {
+            parts.push(self.title.clone());
+        }
+        parts.push(self.channels_label());
+        if self.rate > 0 {
+            let k = self.rate as f64 / 1000.0;
+            parts.push(if k.fract() == 0.0 { format!("{k:.0} kHz") } else { format!("{k:.1} kHz") });
+        }
+        if !self.language.is_empty() {
+            parts.push(self.language.clone());
+        }
+        parts.join(" · ")
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -625,10 +720,14 @@ pub fn matte_sources(p: &Project) -> std::collections::HashSet<Id> {
 #[allow(clippy::large_enum_variant)]
 pub enum Source {
     /// A video, audio or image asset. `in_point` = source seconds shown at the clip's first frame.
+    /// `stream` = which sound stream of the file the clip plays (0-based among its sound streams;
+    /// 0, the default, is the first), for files with several (see `MediaInfo::audio_streams`).
     Media {
         asset: Id,
         #[serde(default, skip_serializing_if = "is_zero")]
         in_point: f64,
+        #[serde(default, skip_serializing_if = "is_default")]
+        stream: u32,
     },
     Text(TextSource),
     /// Full-frame flat colour (or a sized box when `transform`/mask says so).
@@ -1058,6 +1157,10 @@ pub struct Transcript {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub language: String,
     pub words: Vec<Word>,
+    /// The sound stream the words were recognised from (files with several sound streams; 0 = the
+    /// first). Word-cut measuring listens to this stream.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub stream: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

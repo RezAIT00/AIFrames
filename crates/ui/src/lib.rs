@@ -43,6 +43,15 @@ pub trait MediaPreview {
     /// A small frame of `asset` at source time `t` (snapped by the app), for filmstrips and the bin.
     fn thumbnail(&self, asset: &MediaAsset, t: f64) -> Option<egui::TextureId>;
     fn waveform(&self, asset: &MediaAsset) -> Option<Arc<Waveform>>;
+    /// (added) The waveform of sound stream `stream` of `asset` (files with several sound streams;
+    /// 0 = the first, what [`MediaPreview::waveform`] gives). The default knows only stream 0.
+    fn waveform_stream(&self, asset: &MediaAsset, stream: u32) -> Option<Arc<Waveform>> {
+        if stream == 0 {
+            self.waveform(asset)
+        } else {
+            None
+        }
+    }
 }
 
 /// A [`MediaPreview`] that has nothing (tests, headless use).
@@ -114,6 +123,8 @@ pub enum UiAction {
     Import(Vec<PathBuf>),
     /// Run Whisper on this media asset (the app shows progress).
     Transcribe(Id),
+    /// (added) Transcribe sound stream `.1` of the asset (files with several sound streams).
+    TranscribeStream(Id, u32),
     /// Show something in the status bar.
     Status(String),
     /// Ask the AI panel to do something about these ids (pre-fills the prompt).
@@ -183,7 +194,7 @@ mod smoke {
             Op::AddSuggestion { id: None, label: "Mark the end".into(), reason: None, at: None, ops: vec![Op::AddMarker { time: Time::At(6.0), name: None, kind: None, id: None, color: None, note: None }] },
         ];
         aiframes_core::apply_batch(&mut p, &suggest).unwrap();
-        p.transcripts.insert("ma".into(), aiframes_core::Transcript { language: "en".into(), words: (0..40).map(|i| aiframes_core::Word { text: format!(" w{i}"), start: i as f64 * 0.4, end: i as f64 * 0.4 + 0.3, conf: 0.5 }).collect() });
+        p.transcripts.insert("ma".into(), aiframes_core::Transcript { language: "en".into(), words: (0..40).map(|i| aiframes_core::Word { text: format!(" w{i}"), start: i as f64 * 0.4, end: i as f64 * 0.4 + 0.3, conf: 0.5 }).collect(), ..Default::default() });
         let r = resolve(&p);
         let tr = p.transitions[0].id.clone();
         let selections: Vec<Vec<aiframes_core::Id>> = vec![vec![], vec!["c1".into()], vec!["c3".into()], vec!["c1".into(), "c3".into()], vec![tr], vec!["mk1".into()], vec!["v1".into()], vec!["mv".into()], vec![p.clips.last().unwrap().id.clone()]];

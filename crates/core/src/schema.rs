@@ -192,8 +192,34 @@ pub fn schema_docs() -> Value {
                 ("audio_rate", opt("integer", json!(0), "Hz", "Sound sample rate.", json!(48000))),
                 ("codec", opt("string", json!(""), "", "Codec name.", json!("h264"))),
                 ("rotation", opt("integer", json!(0), "degrees", "Display rotation from the file's metadata.", json!(90))),
+                (
+                    "audio_streams",
+                    opt(
+                        "audio_stream[]",
+                        json!([]),
+                        "",
+                        "Every sound stream in file order, when the file has more than one (empty = at most one, described by audio_channels/audio_rate, which always describe stream 0). A clip's source.stream indexes this list.",
+                        json!([{"channels": 2, "rate": 48000, "codec": "aac", "title": "Game"}, {"channels": 1, "rate": 48000, "codec": "aac", "title": "Mic", "language": "eng"}]),
+                    ),
+                ),
             ]),
             json!({"duration": 12.0, "width": 1920, "height": 1080, "fps": 30, "has_video": true}),
+        ),
+    );
+
+    types.insert(
+        "audio_stream".into(),
+        ty(
+            "One sound stream of a media file (media_info.audio_streams[i]; clips choose one with source.stream = i).",
+            fields(vec![
+                ("channels", opt("integer", json!(0), "", "Channels: 1 = mono (plays on both sides), more than 2 are downmixed to stereo.", json!(2))),
+                ("rate", opt("integer", json!(0), "Hz", "Sample rate.", json!(48000))),
+                ("codec", opt("string", json!(""), "", "Codec name.", json!("aac"))),
+                ("layout", opt("string", json!(""), "", "Channel layout as ffmpeg names it.", json!("5.1(side)"))),
+                ("language", opt("string", json!(""), "", "Language tag from the file.", json!("eng"))),
+                ("title", opt("string", json!(""), "", "The stream's title in the file (OBS track names, \"Mic\", \"Discord\").", json!("Mic"))),
+            ]),
+            json!({"channels": 1, "rate": 48000, "codec": "aac", "title": "Mic"}),
         ),
     );
 
@@ -296,6 +322,16 @@ pub fn schema_docs() -> Value {
                 ("type", req("\"media\"", "", "Variant tag.", json!("media"))),
                 ("asset", req("string (media id)", "", "The media asset.", json!("m1"))),
                 ("in_point", opt("number", json!(0.0), "source s", "Source time shown at the clip's first frame.", json!(12.25))),
+                (
+                    "stream",
+                    opt(
+                        "integer",
+                        json!(0),
+                        "",
+                        "Which sound stream of the file the clip plays, 0-based among its sound streams (media_info.audio_streams lists them: OBS game/mic/chat tracks, a camera's two mics). 0 = the first. Set it with set_audio_stream; detach_streams gives every stream its own linked clip.",
+                        json!(1),
+                    ),
+                ),
             ]),
             json!({"type": "media", "asset": "m1", "in_point": 3.0}),
         ),
@@ -530,6 +566,7 @@ pub fn schema_docs() -> Value {
             fields(vec![
                 ("language", opt("string", json!(""), "", "Language code.", json!("en"))),
                 ("words", req("word[]", "", "Words in spoken order.", json!([{"text": "Hello", "start": 0.12, "end": 0.48}]))),
+                ("stream", opt("integer", json!(0), "", "The sound stream the words were recognised from (files with several); word cuts are measured on it.", json!(1))),
             ]),
             json!({"language": "en", "words": [{"text": "Hi", "start": 0.1, "end": 0.3}]}),
         ),
@@ -726,6 +763,7 @@ mod tests {
         struct_type::<Settings>(&d, "settings");
         struct_type::<MediaAsset>(&d, "media");
         struct_type::<MediaInfo>(&d, "media_info");
+        struct_type::<AudioStream>(&d, "audio_stream");
         struct_type::<Track>(&d, "track");
         struct_type::<Clip>(&d, "clip");
         struct_type::<TextSource>(&d, "text");
@@ -750,7 +788,7 @@ mod tests {
         struct_type::<Matte>(&d, "matte");
         struct_type::<Suggestion>(&d, "suggestion");
         // Every struct type is covered by the list above.
-        assert_eq!(d["types"].as_object().unwrap().len(), 28, "a new type needs a check here");
+        assert_eq!(d["types"].as_object().unwrap().len(), 29, "a new type needs a check here");
     }
 
     #[test]

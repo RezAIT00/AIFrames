@@ -444,9 +444,14 @@ pub(crate) fn get_clip(s: &Arc<Services>, args: &J) -> ToolResult {
         if let Some((a, b)) = source_span(c) {
             j["source_range"] = span_j(a, b);
         }
-        if let Source::Media { asset, .. } = &c.source {
+        if let Source::Media { asset, stream, .. } = &c.source {
             if let Some(m) = p.media.iter().find(|m| &m.id == asset) {
                 j["media"] = json!({"id": m.id, "file": file_name(&m.path), "kind": m.kind, "duration": t3(m.info.duration), "has_audio": m.info.has_audio});
+                let n = m.info.audio_stream_count();
+                if n > 1 || *stream > 0 {
+                    j["media"]["audio_streams"] = aiframes_core::describe::audio_streams_json(&m.info);
+                    j["stream"] = json!({"index": stream, "of": n, "label": m.info.audio_stream(*stream).map(|s| s.describe()), "change": "set_audio_stream"});
+                }
             }
             if let (Some(t), Some((a, b))) = (p.transcripts.get(asset), source_span(c)) {
                 let inside: Vec<usize> = t.words.iter().enumerate().filter(|(_, w)| w.start >= a - 1e-6 && w.start < b - 1e-6).map(|(i, _)| i).collect();
@@ -512,6 +517,12 @@ pub(crate) fn list_media(s: &Arc<Services>, args: &J) -> ToolResult {
                 }
                 if let Some(t) = p.transcripts.get(&m.id) {
                     j["transcript_words"] = json!(t.words.len());
+                    if m.info.audio_stream_count() > 1 {
+                        j["transcript_stream"] = json!(t.stream);
+                    }
+                }
+                if m.info.audio_stream_count() > 1 {
+                    j["audio_streams"] = aiframes_core::describe::audio_streams_json(&m.info);
                 }
                 if !g.doc.media_path(m).exists() {
                     j["offline"] = json!(true);
@@ -533,6 +544,7 @@ pub(crate) fn import_media(s: &Arc<Services>, args: &J) -> ToolResult {
         return Err(format!("'place' must be \"none\" or \"append\" (got {place:?})"));
     }
     let use_sidecars = arg_bool(args, "sidecars", true)?;
+    let streams = actions::StreamChoice::from_arg(args.get("streams"))?;
     let (doc_id, d) = find_doc(s, args)?;
     let (project, file) = {
         let g = suite_hub::lock(&d);
@@ -553,6 +565,9 @@ pub(crate) fn import_media(s: &Arc<Services>, args: &J) -> ToolResult {
             if a.kind != MediaKind::Audio {
                 j["size"] = json!(format!("{}x{}", a.info.width, a.info.height));
             }
+            if a.info.audio_stream_count() > 1 {
+                j["audio_streams"] = aiframes_core::describe::audio_streams_json(&a.info);
+            }
             j
         })
         .collect();
@@ -572,7 +587,7 @@ pub(crate) fn import_media(s: &Arc<Services>, args: &J) -> ToolResult {
     }
     let mut clips = Vec::new();
     if place == "append" {
-        let (more, c) = actions::append_ops(&project, &plan.assets, arg_str(args, "track"))?;
+        let (more, c) = actions::append_ops_with(&project, &plan.assets, arg_str(args, "track"), &streams)?;
         ops.extend(more);
         clips = c;
     }
@@ -622,6 +637,7 @@ pub(crate) fn transcribe_options(args: &J) -> Result<aiframes_media::TranscribeO
     }
     o.language = arg_str(args, "language").map(String::from);
     o.prompt = arg_str(args, "prompt").map(String::from);
+    o.stream = crate::util::arg_int(args, "stream", 0, 63)?.map(|v| v as u32);
     Ok(o)
 }
 

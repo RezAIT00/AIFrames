@@ -123,13 +123,22 @@ pub fn loudness_of_pcm(stereo: &[f32], rate: u32) -> Loudness {
 /// mono file measures 3 LU louder than a mono-aware meter reports). Measured at the file's own
 /// sample rate. Files without audio report silence.
 pub fn loudness_of_file(path: &Path) -> Result<Loudness> {
+    loudness_of_file_stream(path, 0)
+}
+
+/// [`loudness_of_file`] of sound stream `stream` of a file with several (0 = the first).
+pub fn loudness_of_file_stream(path: &Path, stream: u32) -> Result<Loudness> {
     let p = probe_full(path)?;
     if !p.info.has_audio {
+        if stream > 0 {
+            return Err(p.no_stream(path, stream));
+        }
         return Ok(Loudness::silent());
     }
-    let rate = if (8000..=384_000).contains(&p.info.audio_rate) { p.info.audio_rate } else { 48_000 };
+    let own = p.audio(stream).map(|a| a.rate).ok_or_else(|| p.no_stream(path, stream))?;
+    let rate = if (8000..=384_000).contains(&own) { own } else { 48_000 };
     let mut m = LoudnessMeter::new(rate);
-    stream_pcm(path, &p, rate, 2, |chunk| {
+    stream_pcm(path, &p, stream, rate, 2, |chunk| {
         m.push(chunk);
         true
     })?;

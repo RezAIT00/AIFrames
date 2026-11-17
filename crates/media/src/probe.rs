@@ -4,7 +4,7 @@
 use crate::error::{MediaError, Result};
 use crate::tools::{command, ff_path, run_capture, tools};
 use crate::util::snap_fps;
-use aiframes_core::model::{MediaInfo, MediaKind};
+use aiframes_core::model::{AudioStream, MediaInfo, MediaKind};
 use serde_json::Value;
 use std::path::Path;
 
@@ -22,7 +22,10 @@ pub(crate) struct Probed {
     pub info: MediaInfo,
     /// Absolute stream indexes (for `-map 0:N`).
     pub video_index: Option<usize>,
+    /// The first sound stream (`audio_streams[0].index`).
     pub audio_index: Option<usize>,
+    /// Every sound stream in file order: `audio_streams[k]` is what a clip with `stream: k` plays.
+    pub audio_streams: Vec<ProbedAudio>,
     /// Source time where the video stream ends: its start offset in the container plus its own
     /// duration (may be earlier than `info.duration` when the audio runs longer).
     pub video_end: f64,
@@ -40,6 +43,69 @@ pub(crate) struct Probed {
     pub pix_fmt: String,
     /// ffprobe's container name ("mov,mp4,m4a,3gp,3g2,mj2", "matroska,webm", "wav", "mp3" ...).
     pub format_name: String,
+}
+
+/// One sound stream as the decoders need it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProbedAudio {
+    /// Absolute stream index (for `-map 0:N`).
+    pub index: usize,
+    pub channels: u32,
+    pub rate: u32,
+}
+
+impl Probed {
+    /// Sound stream `k` (0-based among the sound streams).
+    pub(crate) fn audio(&self, k: u32) -> Option<&ProbedAudio> {
+        if !self.info.has_audio {
+            return None;
+        }
+        self.audio_streams.get(k as usize)
+    }
+
+    /// The error for a sound stream the file does not have.
+    pub(crate) fn no_stream(&self, path: &Path, k: u32) -> MediaError {
+        let n = self.audio_streams.len();
+        MediaError::unsupported(
+            path,
+            match n {
+                0 => format!("has no sound, so it has no sound stream {k}"),
+                1 => format!("has one sound stream (0), not stream {k}"),
+                n => format!("has {n} sound streams (0–{}), not stream {k}", n - 1),
+            },
+        )
+    }
+}
+
+/// Generic track names muxers write when the person gave none (not worth showing as a title).
+fn generic_title(t: &str) -> bool {
+    let l = t.trim().to_ascii_lowercase();
+    l.is_empty()
+        || l.contains("handler")
+        || l == "core media audio"
+        || l.starts_with("isomedia")
+        || l.starts_with("iso media")
+        || l == "stereo"
+        || l == "mono"
+        || l == "surround"
+}
+
+/// The person-facing description of a sound stream from ffprobe's JSON.
+fn audio_stream_info(s: &Value) -> AudioStream {
+    let tag = |names: &[&str]| -> Option<String> {
+        let tags = s.get("tags")?.as_object()?;
+        names.iter().find_map(|n| tags.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).and_then(|(_, v)| v.as_str()).map(|v| v.trim().to_string()))
+    };
+    let title = ["title", "name", "handler_name"].iter().find_map(|n| tag(&[n]).filter(|t| !generic_title(t))).unwrap_or_default();
+    let language = tag(&["language"]).filter(|l| !l.is_empty() && l != "und").unwrap_or_default();
+    AudioStream {
+        channels: s.get("channels").and_then(Value::as_u64).unwrap_or(0) as u32,
+        rate: s.get("sample_rate").and_then(num).unwrap_or(0.0) as u32,
+        codec: s.get("codec_name").and_then(Value::as_str).unwrap_or("").to_string(),
+        layout: s.get("channel_layout").and_then(Value::as_str).filter(|l| *l != "unknown").unwrap_or("").to_string(),
+        language,
+        title,
+    }
 }
 
 const IMAGE_EXTS: &[&str] = &[
@@ -101,6 +167,7 @@ fn probe_image_crate(path: &Path) -> Option<Probed> {
         info: MediaInfo { duration: 0.0, width: w, height: h, codec, rotation, ..Default::default() },
         video_index: None,
         audio_index: None,
+        audio_streams: Vec::new(),
         video_end: 0.0,
         video_start: 0.0,
         video_end_exact: true,
@@ -159,7 +226,8 @@ pub(crate) fn parse_ffprobe(path: &Path, json: &Value) -> Result<Probed> {
     let is_attached_pic = |s: &Value| s.pointer("/disposition/attached_pic").and_then(Value::as_i64) == Some(1);
     let kind_of = |s: &Value| s.get("codec_type").and_then(Value::as_str).unwrap_or("").to_string();
     let video = streams.iter().find(|s| kind_of(s) == "video" && !is_attached_pic(s));
-    let audio = streams.iter().find(|s| kind_of(s) == "audio");
+    let audios: Vec<&Value> = streams.iter().filter(|s| kind_of(s) == "audio").collect();
+    let audio = audios.first().copied();
     let index = |s: &Value| s.get("index").and_then(Value::as_u64).map(|i| i as usize);
 
     if video.is_none() && audio.is_none() {
@@ -179,6 +247,13 @@ pub(crate) fn parse_ffprobe(path: &Path, json: &Value) -> Result<Probed> {
         info: MediaInfo::default(),
         video_index: None,
         audio_index: audio.and_then(index),
+        audio_streams: audios
+            .iter()
+            .filter_map(|s| {
+                let a = audio_stream_info(s);
+                Some(ProbedAudio { index: index(s)?, channels: a.channels, rate: a.rate })
+            })
+            .collect(),
         video_end: 0.0,
         video_start: 0.0,
         video_end_exact: false,
@@ -193,6 +268,9 @@ pub(crate) fn parse_ffprobe(path: &Path, json: &Value) -> Result<Probed> {
         info.has_audio = true;
         info.audio_channels = a.get("channels").and_then(Value::as_u64).unwrap_or(0) as u32;
         info.audio_rate = a.get("sample_rate").and_then(num).unwrap_or(0.0) as u32;
+    }
+    if audios.len() > 1 {
+        info.audio_streams = audios.iter().map(|s| audio_stream_info(s)).collect();
     }
 
     if let Some(v) = video {
@@ -336,6 +414,40 @@ mod tests {
         assert_eq!(p.video_index, Some(0));
         assert_eq!(p.audio_index, Some(1));
         assert!(p.untagged_matrix);
+    }
+
+    #[test]
+    fn parse_every_audio_stream() {
+        let j = json!({
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080, "r_frame_rate": "60/1", "avg_frame_rate": "60/1"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 2, "channel_layout": "stereo", "sample_rate": "48000",
+                 "tags": {"language": "und", "handler_name": "SoundHandler"}},
+                {"index": 2, "codec_type": "audio", "codec_name": "aac", "channels": 1, "channel_layout": "mono", "sample_rate": "44100",
+                 "tags": {"language": "eng", "handler_name": "SoundHandler", "name": "Mic"}},
+                {"index": 3, "codec_type": "data", "codec_name": "bin_data"},
+                {"index": 4, "codec_type": "audio", "codec_name": "ac3", "channels": 6, "channel_layout": "5.1(side)", "sample_rate": "48000",
+                 "tags": {"title": "Discord"}}
+            ],
+            "format": {"format_name": "matroska,webm", "duration": "60.0"}
+        });
+        let p = parse_ffprobe(Path::new("obs.mkv"), &j).unwrap();
+        assert_eq!(p.audio_index, Some(1));
+        assert_eq!(p.audio_streams.iter().map(|a| a.index).collect::<Vec<_>>(), vec![1, 2, 4]);
+        assert_eq!((p.info.audio_channels, p.info.audio_rate), (2, 48000), "stream 0 stays in the old fields");
+        let s = &p.info.audio_streams;
+        assert_eq!(s.len(), 3);
+        assert_eq!((s[0].title.as_str(), s[0].language.as_str(), s[0].channels), ("", "", 2), "generic handler names and und are not shown");
+        assert_eq!((s[1].title.as_str(), s[1].language.as_str(), s[1].rate), ("Mic", "eng", 44100));
+        assert_eq!((s[2].title.as_str(), s[2].layout.as_str(), s[2].channels), ("Discord", "5.1(side)", 6));
+        assert_eq!(p.info.audio_stream_count(), 3);
+        // A single stream keeps the compact form.
+        let one = json!({"streams": [{"index": 0, "codec_type": "audio", "codec_name": "aac", "channels": 2, "sample_rate": "48000"}],
+                         "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "3.0"}});
+        let p = parse_ffprobe(Path::new("x.m4a"), &one).unwrap();
+        assert!(p.info.audio_streams.is_empty());
+        assert_eq!(p.info.audio_stream_count(), 1);
+        assert_eq!(p.audio_streams.len(), 1);
     }
 
     #[test]

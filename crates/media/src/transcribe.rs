@@ -27,6 +27,9 @@ pub struct TranscribeOptions {
     pub prompt: Option<String>,
     /// Only transcribe this `[start, end]` of the source (seconds); word times stay in source seconds.
     pub range: Option<[f64; 2]>,
+    /// Which sound stream to listen to (files with several); `None` = the file's speech stream
+    /// ([`aiframes_core::MediaInfo::speech_stream`]: one titled mic/voice/..., else the first).
+    pub stream: Option<u32>,
     pub progress: Option<ProgressFn>,
     /// Set to `true` to stop; `transcribe` then returns `MediaError::Cancelled`.
     pub cancel: Option<Arc<AtomicBool>>,
@@ -34,7 +37,7 @@ pub struct TranscribeOptions {
 
 impl Default for TranscribeOptions {
     fn default() -> Self {
-        TranscribeOptions { model: "turbo".into(), language: None, device: None, prompt: None, range: None, progress: None, cancel: None }
+        TranscribeOptions { model: "turbo".into(), language: None, device: None, prompt: None, range: None, stream: None, progress: None, cancel: None }
     }
 }
 
@@ -46,20 +49,24 @@ impl std::fmt::Debug for TranscribeOptions {
             .field("device", &self.device)
             .field("prompt", &self.prompt)
             .field("range", &self.range)
+            .field("stream", &self.stream)
             .field("progress", &self.progress.is_some())
             .field("cancel", &self.cancel.is_some())
             .finish()
     }
 }
 
-/// Transcribes the file's speech into words with source-second timestamps.
+/// Transcribes the file's speech into words with source-second timestamps. The transcript's
+/// `stream` says which sound stream it heard.
 pub fn transcribe(path: &Path, opts: &TranscribeOptions) -> Result<Transcript> {
     let t = tools()?;
     let whisper = t.whisper.clone().ok_or_else(|| MediaError::ToolMissing { tool: "whisper", help: whisper_help() })?;
     let p = probe_full(path)?;
-    let Some(ai) = p.audio_index.filter(|_| p.info.has_audio) else {
+    if !p.info.has_audio || p.audio_streams.is_empty() {
         return Err(MediaError::unsupported(path, "has no audio stream to transcribe"));
-    };
+    }
+    let stream = opts.stream.unwrap_or_else(|| p.info.speech_stream());
+    let ai = p.audio(stream).ok_or_else(|| p.no_stream(path, stream))?.index;
     let cancelled = || opts.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
     let report = |f: f32| {
         if let Some(cb) = &opts.progress {
@@ -98,8 +105,9 @@ pub fn transcribe(path: &Path, opts: &TranscribeOptions) -> Result<Transcript> {
     for (i, device) in devices.iter().enumerate() {
         match run_whisper(&whisper, &t.ffmpeg, &wav, &tmp.0, device, opts, &cancelled, &report) {
             Ok(json) => {
-                let tr = parse_whisper_json(&json, offset)
+                let mut tr = parse_whisper_json(&json, offset)
                     .ok_or_else(|| MediaError::tool("whisper", Some(path), "transcribe", None, "it wrote JSON without segments"))?;
+                tr.stream = stream;
                 report(1.0);
                 return Ok(tr);
             }
@@ -270,7 +278,7 @@ pub(crate) fn parse_whisper_json(v: &Value, offset: f64) -> Option<Transcript> {
         }
         last = w.start;
     }
-    Some(Transcript { language, words })
+    Some(Transcript { language, words, ..Default::default() })
 }
 
 #[cfg(test)]
