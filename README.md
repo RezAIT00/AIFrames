@@ -40,7 +40,9 @@ installed copies pick it up on their next check.
 
 ## The editor
 
-- **Timeline**: video and audio tracks with filmstrips and waveforms, snapping, Select / Razor / Slip / Slide /
+- **Timeline**: video and audio tracks with filmstrips and waveforms, multi-track audio (a file with several sound
+  streams, like an OBS recording with game, mic and chat, comes in as the picture plus one linked audio clip per
+  stream, each on its own track with its own mute, volume and waveform; the inspector picks a clip's stream), snapping, Select / Razor / Slip / Slide /
   Ripple / Roll tools, live ghost previews of every drag, keyframe lanes and volume lines on the clips,
   transitions on cuts, markers and YouTube chapters, anchor lines showing what follows what, track
   mute/solo/lock/hide and drag-to-reorder, Set spacing / Close gaps.
@@ -85,7 +87,7 @@ of every type) are there too. Each AI session keeps to its own project, so other
 ## Command line
 
 `aiframes help` lists everything: `new`, `import`, `describe`, `timeline`, `validate`, `apply ops.json`,
-`snapshot`, `contact-sheet`, `render`, `transcribe`, `chapters`, `history`, `ops` (all 55 edit operations
+`snapshot`, `contact-sheet`, `render`, `transcribe`, `chapters`, `history`, `ops` (all 60 edit operations
 with examples), `demo <dir>` (sample media and a project using most features). When the window has the
 project open, CLI commands run in the window instead of writing the file behind its back.
 
@@ -101,7 +103,7 @@ target\release\aiframes.exe demo out\demo      # then open out\demo\demo.aifr
 scripts\install.ps1                            # install for this user and register .aifr
 ```
 
-Crates: `core` (model, anchors, 55 ops, history, validation), `media` (ffmpeg decode/encode, audio cache,
+Crates: `core` (model, anchors, 60 ops, history, validation), `media` (ffmpeg decode/encode, audio cache,
 analysis, Whisper), `render` (compositor, text, effects, transitions, mixer, export), `ui` (timeline and
 panels), `mcp` (tools, CLI, shared GUI/AI services), `app` (the window), all under `crates/`. `shared/` holds the
 generic MCP server framework, document hub, egui theme helpers and Windows file-association code.

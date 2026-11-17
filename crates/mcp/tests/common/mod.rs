@@ -63,6 +63,21 @@ pub fn video() -> PathBuf {
     })
 }
 
+/// An OBS-style recording: 6 s of testsrc2 with three sound streams — 0 "Game" 440 Hz stereo, 1 "Mic"
+/// the speech pattern of [`talk`] (220 Hz, mono), 2 "Discord" 880 Hz stereo.
+pub fn obs_video() -> PathBuf {
+    fixture("obs.mkv", |out| {
+        ffmpeg(&[
+            "-f", "lavfi", "-i", "testsrc2=s=320x180:r=30:d=6",
+            "-f", "lavfi", "-i", "aevalsrc='0.2*sin(2*PI*440*t)':s=48000:d=6:c=stereo",
+            "-f", "lavfi", "-i", "aevalsrc='0.5*sin(2*PI*220*t)*between(mod(t,2.5),0.2,1.7)':s=48000:d=6:c=mono",
+            "-f", "lavfi", "-i", "aevalsrc='0.2*sin(2*PI*880*t)':s=48000:d=6:c=stereo",
+            "-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "3:a", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            "-metadata:s:a:0", "title=Game", "-metadata:s:a:1", "title=Mic", "-metadata:s:a:2", "title=Discord", "-f", "matroska", out,
+        ])
+    })
+}
+
 /// 4 s: 2 s of testsrc2 then a hard cut to 2 s of smptebars (scene change at 2.0 s).
 pub fn cut_video() -> PathBuf {
     fixture("cut.mp4", |out| {

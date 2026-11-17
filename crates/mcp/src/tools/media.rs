@@ -112,13 +112,23 @@ fn check_cancel(c: &AtomicBool) -> Result<(), String> {
 
 pub(crate) fn transcribe(s: &Arc<Services>, args: &J) -> ToolResult {
     let (id, d) = find_doc(s, args)?;
-    let (asset, file, had) = {
+    let (asset, file, had, stream) = {
         let g = suite_hub::lock(&d);
-        let (asset, _) = asset_arg(&g.doc.project, args)?;
-        let file = g.doc.project.media.iter().find(|m| m.id == asset).map(|m| file_name(&m.path).to_string()).unwrap_or_default();
-        (asset.clone(), file, g.doc.project.transcripts.contains_key(&asset))
+        let (asset, clip) = asset_arg(&g.doc.project, args)?;
+        let p = &g.doc.project;
+        let file = p.media.iter().find(|m| m.id == asset).map(|m| file_name(&m.path).to_string()).unwrap_or_default();
+        // With a clip and no explicit stream: the stream that clip plays.
+        let clip_stream = clip.and_then(|c| p.clips.iter().find(|x| x.id == c)).and_then(|c| match &c.source {
+            Source::Media { stream, .. } if !c.muted => Some(*stream),
+            _ => None,
+        });
+        (asset.clone(), file, p.transcripts.contains_key(&asset), clip_stream)
     };
-    let job = actions::start_transcribe_by(s, id, &asset, &author_of(args), transcribe_options(args)?, session_of(args))?;
+    let mut opts = transcribe_options(args)?;
+    if opts.stream.is_none() {
+        opts.stream = stream;
+    }
+    let job = actions::start_transcribe_by(s, id, &asset, &author_of(args), opts, session_of(args))?;
     s.hub.notify(format!("{}: transcribing {file}", who(&author_of(args))));
     let mut res = json!({"job": job, "project": id, "asset": asset, "status": "running", "next": "follow it with jobs (or wait_seconds); then get_transcript / search_transcript"});
     if had {
@@ -570,11 +580,13 @@ pub(crate) fn delete_words(s: &Arc<Services>, args: &J) -> ToolResult {
     let wave = if snap {
         let path = with_doc(s, args, |_, g| {
             let (asset, _) = asset_arg(&g.doc.project, args)?;
-            Ok(actions::has_sound(&g.doc.project, &asset).then(|| asset_path(&g.doc, &asset).ok()).flatten())
+            // Measured on the stream the words were heard in.
+            let stream = g.doc.project.transcripts.get(&asset).map(|t| t.stream).unwrap_or(0);
+            Ok(actions::has_sound(&g.doc.project, &asset).then(|| asset_path(&g.doc, &asset).ok().map(|p| (p, stream))).flatten())
         })
         .ok()
         .flatten();
-        path.and_then(|p| s.pool.waveform(&p).ok()).filter(|w| !w.is_empty())
+        path.and_then(|(p, k)| s.pool.waveform_stream(&p, k).ok()).filter(|w| !w.is_empty())
     } else {
         None
     };
@@ -707,6 +719,28 @@ struct Located {
     seconds: f64,
     has_sound: bool,
     has_video: bool,
+    /// The sound stream to analyse: `stream` argument, else the clip's, else the speech stream.
+    stream: u32,
+    /// The file has several sound streams (results then name the stream).
+    multi: bool,
+}
+
+/// The sound stream an analysis of `asset` listens to: the `stream` argument, else the stream the
+/// clip plays, else the file's speech stream; an error for a stream the file does not have.
+pub(crate) fn analysis_stream(p: &aiframes_core::Project, asset: &str, clip: Option<&str>, args: &J) -> Result<u32, String> {
+    let m = p.media.iter().find(|m| m.id == asset).ok_or_else(|| format!("unknown media asset '{asset}'"))?;
+    let n = m.info.audio_stream_count();
+    let k = match crate::util::arg_int(args, "stream", 0, 63)? {
+        Some(k) => k as u32,
+        None => match clip.and_then(|c| p.clips.iter().find(|x| x.id == c)).map(|c| &c.source) {
+            Some(Source::Media { stream, .. }) => *stream,
+            _ => m.info.speech_stream(),
+        },
+    };
+    if k > 0 && k as usize >= n {
+        return Err(format!("{asset} has {n} sound stream(s){}, not stream {k}", if n > 0 { format!(" (0–{})", n - 1) } else { String::new() }));
+    }
+    Ok(k)
 }
 
 fn locate(s: &Arc<Services>, args: &J) -> Result<Located, String> {
@@ -714,12 +748,15 @@ fn locate(s: &Arc<Services>, args: &J) -> Result<Located, String> {
         let (asset, clip) = asset_arg(&g.doc.project, args)?;
         let path = asset_path(&g.doc, &asset)?;
         let m = g.doc.project.media.iter().find(|m| m.id == asset).ok_or_else(|| format!("unknown media asset '{asset}'"))?;
+        let stream = analysis_stream(&g.doc.project, &asset, clip.as_deref(), args)?;
         Ok(Located {
             doc: id,
             file: file_name(&m.path).to_string(),
             seconds: m.info.duration,
             has_sound: actions::has_sound(&g.doc.project, &asset),
             has_video: m.kind == MediaKind::Video && m.info.has_video,
+            multi: m.info.audio_stream_count() > 1,
+            stream,
             asset,
             clip,
             path,
@@ -810,7 +847,7 @@ pub(crate) fn detect_silence(s: &Arc<Services>, args: &J) -> ToolResult {
     let (s2, a2) = (s.clone(), args.clone());
     let label = format!("Detect silence in {}", loc.file);
     analysis(s, args, label, loc.doc, loc.seconds, move |_| {
-        let sil = aiframes_media::detect_silence(&loc.path, noise, min).map_err(|e| e.to_string())?;
+        let sil = aiframes_media::detect_silence_stream(&loc.path, loc.stream, noise, min).map_err(|e| e.to_string())?;
         with_doc(&s2, &a2, |id, g| {
             let (p, r) = (&g.doc.project, g.doc.resolved());
             let clip = loc.clip.as_ref().and_then(|c| p.clips.iter().find(|x| &x.id == c));
@@ -837,6 +874,9 @@ pub(crate) fn detect_silence(s: &Arc<Services>, args: &J) -> ToolResult {
                 })
                 .collect();
             let mut res = json!({"project": id, "asset": loc.asset, "noise_db": noise, "min_length": min, "count": list.len(), "total_seconds": t3(total), "silences": list});
+            if loc.multi {
+                res["stream"] = json!(loc.stream);
+            }
             if let Some(c) = &loc.clip {
                 res["clip"] = json!(c);
                 res["next"] = json!("remove_silences cuts them out of the clip (try plan:true first)");
@@ -878,12 +918,14 @@ pub(crate) fn remove_silences(s: &Arc<Services>, args: &J) -> ToolResult {
         if clips.is_empty() {
             return Err("pass 'clip', 'clips' or 'track' (the media clips to remove silences from)".into());
         }
-        let mut files: HashMap<Id, PathBuf> = HashMap::new();
+        // Silence is measured on the stream the (first listed) clip of each file plays, or `stream`.
+        let mut files: HashMap<Id, (PathBuf, u32)> = HashMap::new();
         let mut seconds = 0.0;
         for c in &clips {
             if let Source::Media { asset, .. } = &clip_of(p, c)?.source {
                 if actions::has_sound(p, asset) && !files.contains_key(asset) {
-                    files.insert(asset.clone(), asset_path(&g.doc, asset)?);
+                    let stream = analysis_stream(p, asset, Some(c), args)?;
+                    files.insert(asset.clone(), (asset_path(&g.doc, asset)?, stream));
                     seconds += p.media.iter().find(|m| &m.id == asset).map(|m| m.info.duration).unwrap_or(0.0);
                 }
             }
@@ -894,8 +936,8 @@ pub(crate) fn remove_silences(s: &Arc<Services>, args: &J) -> ToolResult {
     let label = format!("Remove silences from {} clip(s)", clips.len());
     analysis(s, args, label, doc, seconds, move |cancel| {
         let mut silences: HashMap<Id, Vec<[f64; 2]>> = HashMap::new();
-        for (asset, path) in &files {
-            silences.insert(asset.clone(), aiframes_media::detect_silence(path, o.noise_db, o.min_len).map_err(|e| e.to_string())?);
+        for (asset, (path, stream)) in &files {
+            silences.insert(asset.clone(), aiframes_media::detect_silence_stream(path, *stream, o.noise_db, o.min_len).map_err(|e| e.to_string())?);
             check_cancel(&cancel)?;
         }
         let (ops, cuts, notes) = with_doc(&s2, &a2, |_, g| actions::silence_cut_ops(&g.doc.project, g.doc.resolved(), &clips, &silences, &o))?;
@@ -1065,14 +1107,14 @@ fn complete_audio(s: &Services, inp: &RenderInput, from: f64, to: f64) -> Vec<St
     let mut seen = HashSet::new();
     let mut warnings = Vec::new();
     for c in &p.clips {
-        let Source::Media { asset, .. } = &c.source else { continue };
+        let Source::Media { asset, stream, .. } = &c.source else { continue };
         let Some(sp) = inp.resolved.span(&c.id) else { continue };
-        if sp.end <= from || sp.start >= to || !seen.insert(asset.clone()) {
+        if sp.end <= from || sp.start >= to || !seen.insert((asset.clone(), *stream)) {
             continue;
         }
         let Some(m) = p.media.iter().find(|m| &m.id == asset).filter(|m| m.info.has_audio && m.kind != MediaKind::Image) else { continue };
         let path = crate::util::abs_path(&m.path, Some(&inp.dir));
-        if let Err(e) = s.pool.audio_complete(&path, rate) {
+        if let Err(e) = s.pool.audio_complete_stream(&path, rate, *stream) {
             warnings.push(format!("{} ({}): {e}", m.id, file_name(&m.path)));
         }
     }
@@ -1090,9 +1132,13 @@ pub(crate) fn analyze_audio(s: &Arc<Services>, args: &J) -> ToolResult {
         }
         let label = format!("Analyse the sound of {}", loc.file);
         return analysis(s, args, label, loc.doc, loc.seconds, move |_| {
-            let l = aiframes_media::loudness_of_file(&loc.path).map_err(|e| e.to_string())?;
-            let sil = aiframes_media::detect_silence(&loc.path, silence_db, silence_min).map_err(|e| e.to_string())?;
-            Ok(json!({"project": loc.doc, "asset": loc.asset, "loudness": loud_j(&l), "silences": sil.iter().map(|x| span_j(x[0], x[1])).collect::<Vec<_>>()}))
+            let l = aiframes_media::loudness_of_file_stream(&loc.path, loc.stream).map_err(|e| e.to_string())?;
+            let sil = aiframes_media::detect_silence_stream(&loc.path, loc.stream, silence_db, silence_min).map_err(|e| e.to_string())?;
+            let mut res = json!({"project": loc.doc, "asset": loc.asset, "loudness": loud_j(&l), "silences": sil.iter().map(|x| span_j(x[0], x[1])).collect::<Vec<_>>()});
+            if loc.multi {
+                res["stream"] = json!(loc.stream);
+            }
+            Ok(res)
         });
     }
     let (id, inp) = with_doc(s, args, |id, g| Ok((id, g.render_input())))?;

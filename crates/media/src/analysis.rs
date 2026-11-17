@@ -87,14 +87,22 @@ const SILENCE_WINDOW: f64 = 0.010;
 /// `noise_db` dBFS (RMS over 10 ms windows, the louder channel). A positive `noise_db` is read as
 /// negative (40 = -40 dBFS). Files without audio are one silence over their whole duration.
 pub fn detect_silence(path: &Path, noise_db: f64, min_len: f64) -> Result<Vec<[f64; 2]>> {
+    detect_silence_stream(path, 0, noise_db, min_len)
+}
+
+/// [`detect_silence`] in sound stream `stream` of a file with several (0 = the first).
+pub fn detect_silence_stream(path: &Path, stream: u32, noise_db: f64, min_len: f64) -> Result<Vec<[f64; 2]>> {
     let p = probe_full(path)?;
     if !p.info.has_audio {
+        if stream > 0 {
+            return Err(p.no_stream(path, stream));
+        }
         let d = p.info.duration;
         return Ok(if d > 0.0 && d >= min_len { vec![[0.0, d]] } else { vec![] });
     }
     let rate = 16_000u32;
     let mut gate = SilenceGate::new(rate, noise_db, min_len);
-    stream_pcm(path, &p, rate, 2, |chunk| {
+    stream_pcm(path, &p, stream, rate, 2, |chunk| {
         gate.push(chunk);
         true
     })?;
@@ -221,7 +229,7 @@ pub fn analyze_beats(path: &Path) -> Result<Beats> {
         return Err(MediaError::unsupported(path, "has no audio stream to detect beats in"));
     }
     let mut mono: Vec<f32> = Vec::new();
-    stream_pcm(path, &p, BEAT_RATE, 1, |chunk| {
+    stream_pcm(path, &p, 0, BEAT_RATE, 1, |chunk| {
         mono.extend_from_slice(chunk);
         true
     })?;

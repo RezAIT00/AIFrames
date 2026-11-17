@@ -227,21 +227,33 @@ impl Cx<'_> {
             Op::SlideClip { clip, delta } => self.slide_clip(clip, *delta),
             Op::SetSpeed { clip, speed, keep, linked } => self.set_speed(clip, *speed, *keep, *linked),
             Op::FreezeFrame { clip, at, duration, new_id } => self.freeze_frame(clip, *at, *duration, new_id.as_deref()),
-            Op::DetachAudio { clip, track, new_id } => self.detach_audio(clip, track, new_id.as_deref()),
+            Op::DetachAudio { clip, track, new_id, stream } => self.detach_audio(clip, track, new_id.as_deref(), *stream),
+            Op::DetachStreams { clip, streams, tracks, new_ids } => self.detach_streams(clip, streams.as_deref(), tracks.as_deref(), new_ids.as_deref()),
+            Op::SetAudioStream { clip, stream } => self.set_audio_stream(clip, *stream),
             Op::ReplaceMedia { clip, asset, in_point } => {
                 let i = editable(self.p, clip)?;
                 media_ix(self.p, asset)?;
                 if let Some(ip) = in_point {
                     check_finite("in_point", *ip)?;
                 }
+                let new_asset = self.p.media[media_ix(self.p, asset)?].clone();
+                let mut reset = None;
                 match &mut self.p.clips[i].source {
-                    Source::Media { asset: a, in_point: ip } => {
+                    Source::Media { asset: a, in_point: ip, stream } => {
                         *a = asset.clone();
                         if let Some(v) = in_point {
                             *ip = *v;
                         }
+                        // The new file may have fewer sound streams: play its first one.
+                        if stream_problem(&new_asset, *stream).is_some() {
+                            reset = Some(*stream);
+                            *stream = 0;
+                        }
                     }
                     _ => return fail(format!("{clip} is not a media clip; replace_media swaps the media of video, audio and image clips.")),
+                }
+                if let Some(k) = reset {
+                    self.warn(format!("{asset} has no sound stream {k}, so {clip} now plays its stream 0."));
                 }
                 self.summary = format!("{clip} now plays {asset}");
                 Ok(())
@@ -1853,7 +1865,11 @@ impl Cx<'_> {
         f.reverse = false;
         f.duration = duration;
         f.until = None;
-        f.source = Source::Media { asset: asset_id, in_point: src };
+        let stream = match &c.source {
+            Source::Media { stream, .. } => *stream,
+            _ => 0,
+        };
+        f.source = Source::Media { asset: asset_id, in_point: src, stream };
         f.muted = true;
         f.fade_in = 0.0;
         f.fade_out = 0.0;
@@ -1906,7 +1922,7 @@ impl Cx<'_> {
         Ok(())
     }
 
-    fn detach_audio(&mut self, clip: &str, track: &str, new_id: Option<&str>) -> Result<(), EditError> {
+    fn detach_audio(&mut self, clip: &str, track: &str, new_id: Option<&str>, stream: Option<u32>) -> Result<(), EditError> {
         let ci = editable(self.p, clip)?;
         let ti = track_ix(self.p, track)?;
         ensure_unlocked(self.p, track)?;
@@ -1915,7 +1931,15 @@ impl Cx<'_> {
             return fail(format!("{clip} is a {} clip; only video clips have sound to detach.", kind_word(&c)));
         };
         if asset.kind != MediaKind::Video {
-            return fail(format!("{clip} plays {} media; detach_audio separates the sound of a video clip.", if asset.kind == MediaKind::Audio { "audio-only" } else { "still image" }));
+            let more = if asset.kind == MediaKind::Audio && asset.info.audio_stream_count() > 1 {
+                format!(" To give its other sound streams their own clips, use {{\"op\":\"detach_streams\",\"clip\":\"{clip}\"}}.")
+            } else {
+                String::new()
+            };
+            return fail(format!(
+                "{clip} plays {} media; detach_audio separates the sound of a video clip.{more}",
+                if asset.kind == MediaKind::Audio { "audio-only" } else { "still image" }
+            ));
         }
         if asset.info.duration > 0.0 && !asset.info.has_audio {
             return fail(format!("{} has no audio stream, so {clip} has no sound to detach.", asset.id));
@@ -1927,9 +1951,32 @@ impl Cx<'_> {
                 if auds.is_empty() { "add one with {\"op\":\"add_track\",\"kind\":\"audio\"}".to_string() } else { auds.join(", ") }
             ));
         }
-        if let Some(k) = linked_of(self.p, clip).first() {
-            return fail(format!("{clip}'s sound is already detached as {k}."));
+        let stream = stream.unwrap_or_else(|| clip_stream(&c));
+        if let Some(why) = stream_problem(asset, stream) {
+            return fail(why);
         }
+        let multi = asset.info.audio_stream_count() > 1;
+        let followers = linked_of(self.p, clip);
+        if let Some(k) = followers.iter().find(|k| self.p.clips.iter().any(|x| &x.id == *k && clip_stream(x) == stream)) {
+            return fail(if multi { format!("{clip}'s sound stream {stream} is already detached as {k}.") } else { format!("{clip}'s sound is already detached as {k}.") });
+        }
+        let was_muted = c.muted && followers.is_empty();
+        let aid = self.detach_one(ci, track, new_id, stream)?;
+        if was_muted {
+            self.warn(format!("{clip} was muted; its detached audio {aid} plays (mute {aid} if you want silence)."));
+        }
+        self.summary = if multi {
+            format!("Detached sound stream {stream} of {clip} to {aid} on {track} (linked, anchored with {clip})")
+        } else {
+            format!("Detached the sound of {clip} to {aid} on {track} (linked, anchored with {clip})")
+        };
+        Ok(())
+    }
+
+    /// Adds a linked audio clip of clip `ci` playing `stream` on `track` and mutes a video clip's own
+    /// sound. Checks are the caller's.
+    fn detach_one(&mut self, ci: usize, track: &str, new_id: Option<&str>, stream: u32) -> Result<Id, EditError> {
+        let c = self.p.clips[ci].clone();
         let aid = match new_id {
             Some(n) => {
                 self.ids.claim(n)?;
@@ -1938,13 +1985,13 @@ impl Cx<'_> {
             None => self.ids.fresh("c"),
         };
         self.made.push(aid.clone());
-        if c.muted {
-            self.warn(format!("{clip} was muted; its detached audio {aid} plays (mute {aid} if you want silence)."));
-        }
+        let m = media_of(self.p, &c);
+        let title = m.filter(|m| m.info.audio_stream_count() > 1).and_then(|m| m.info.audio_stream(stream)).map(|s| s.title).filter(|t| !t.is_empty());
+        let is_video = m.is_some_and(|m| m.kind == MediaKind::Video);
         let mut a = c.clone();
         a.id = aid.clone();
         a.track = track.to_string();
-        a.start = Time::Anchored(Anchor { to: AnchorTarget::With(clip.to_string()), offset: 0.0 });
+        a.start = Time::Anchored(Anchor { to: AnchorTarget::With(c.id.clone()), offset: 0.0 });
         a.transform = Transform::default();
         a.opacity = Param::Value(1.0);
         a.blend = BlendMode::Normal;
@@ -1952,10 +1999,175 @@ impl Cx<'_> {
         a.muted = false;
         a.enabled = true;
         a.notes = String::new();
-        a.name = if c.name.is_empty() { String::new() } else { format!("{} (audio)", c.name) };
-        self.p.clips[ci].muted = true;
+        if let Source::Media { stream: s, .. } = &mut a.source {
+            *s = stream;
+        }
+        a.name = match (c.name.is_empty(), title) {
+            (true, None) => String::new(),
+            (true, Some(t)) => t,
+            (false, None) => format!("{} (audio)", c.name),
+            (false, Some(t)) => format!("{} ({t})", c.name),
+        };
+        if is_video {
+            self.p.clips[ci].muted = true;
+        }
         self.p.clips.push(a);
-        self.summary = format!("Detached the sound of {clip} to {aid} on {track} (linked, anchored with {clip})");
+        Ok(aid)
+    }
+
+    fn detach_streams(&mut self, clip: &str, streams: Option<&[u32]>, tracks: Option<&[Id]>, new_ids: Option<&[Id]>) -> Result<(), EditError> {
+        let ci = editable(self.p, clip)?;
+        let c = self.p.clips[ci].clone();
+        let Some(asset) = media_of(self.p, &c).cloned() else {
+            return fail(format!("{clip} is a {} clip; only video and audio clips have sound streams.", kind_word(&c)));
+        };
+        let n = asset.info.audio_stream_count();
+        if asset.kind == MediaKind::Image || n == 0 {
+            return fail(format!("{} \"{}\" has no sound, so {clip} has no sound streams to detach.", asset.id, util::file_name(&asset.path)));
+        }
+        let is_video = asset.kind == MediaKind::Video;
+        let own = clip_stream(&c);
+        let taken: Vec<(Id, u32)> = linked_of(self.p, clip).into_iter().filter_map(|k| self.p.clips.iter().find(|x| x.id == k).map(|x| (k, clip_stream(x)))).collect();
+        let list: Vec<u32> = match streams {
+            Some(s) => {
+                if s.is_empty() {
+                    return fail("`streams` is empty; omit it to detach every stream.");
+                }
+                let mut seen = HashSet::new();
+                for k in s {
+                    if !seen.insert(*k) {
+                        return fail(format!("stream {k} is listed twice in `streams`."));
+                    }
+                    if let Some(why) = stream_problem(&asset, *k) {
+                        return fail(why);
+                    }
+                    if let Some((id, _)) = taken.iter().find(|(_, x)| x == k) {
+                        return fail(format!("{clip}'s sound stream {k} is already detached as {id}."));
+                    }
+                    if !is_video && *k == own {
+                        return fail(format!("{clip} plays stream {k} itself; list only its other streams."));
+                    }
+                }
+                s.to_vec()
+            }
+            None => (0..n as u32).filter(|k| !taken.iter().any(|(_, x)| x == k) && (is_video || *k != own)).collect(),
+        };
+        if list.is_empty() {
+            let have: Vec<String> = taken.iter().map(|(id, k)| format!("stream {k} → {id}")).collect();
+            return fail(format!(
+                "every sound stream of {clip} already has its own clip ({}); nothing to detach.",
+                if have.is_empty() { format!("{clip} plays its only stream itself") } else { have.join(", ") }
+            ));
+        }
+        if let Some(ids) = new_ids {
+            if ids.len() != list.len() {
+                return fail(format!("`new_ids` has {} id(s) but {} stream(s) are being detached ({list:?}); give one id per stream.", ids.len(), list.len()));
+            }
+        }
+        let r = resolve(self.p);
+        let span = span_of(&r, clip)?;
+        let chosen: Vec<Id> = match tracks {
+            Some(ts) => {
+                if ts.len() != list.len() {
+                    return fail(format!(
+                        "`tracks` has {} track(s) but {} stream(s) are being detached ({list:?}); give one audio track per stream, or omit `tracks`.",
+                        ts.len(),
+                        list.len()
+                    ));
+                }
+                let mut seen = HashSet::new();
+                for t in ts {
+                    let ti = track_ix(self.p, t)?;
+                    ensure_unlocked(self.p, t)?;
+                    if self.p.tracks[ti].kind != TrackKind::Audio {
+                        return fail(format!("{t} is a video track; each stream goes on an audio track."));
+                    }
+                    if !seen.insert(t.as_str()) {
+                        return fail(format!("track {t} is listed twice in `tracks`; each stream needs its own track."));
+                    }
+                }
+                ts.to_vec()
+            }
+            None => {
+                let free: Vec<Id> = self
+                    .p
+                    .tracks
+                    .iter()
+                    .filter(|t| t.kind == TrackKind::Audio && !t.locked && t.id != c.track)
+                    .filter(|t| !self.p.clips.iter().any(|x| x.track == t.id && r.span(&x.id).is_some_and(|s| s.start < span.end - EPS && s.end > span.start + EPS)))
+                    .map(|t| t.id.clone())
+                    .collect();
+                let mut free = free.into_iter();
+                let mut out: Vec<Id> = Vec::new();
+                for k in &list {
+                    match free.next() {
+                        Some(t) => out.push(t),
+                        None => {
+                            let id = self.ids.fresh("a");
+                            self.made.push(id.clone());
+                            let name = asset.info.audio_stream(*k).map(|s| s.title).filter(|t| !t.is_empty()).unwrap_or_default();
+                            self.p.tracks.push(Track {
+                                id: id.clone(),
+                                name,
+                                kind: TrackKind::Audio,
+                                role: String::new(),
+                                muted: false,
+                                hidden: false,
+                                locked: false,
+                                solo: false,
+                                volume: 1.0,
+                            });
+                            out.push(id);
+                        }
+                    }
+                }
+                out
+            }
+        };
+        let mut done = Vec::new();
+        for (i, (k, t)) in list.iter().zip(&chosen).enumerate() {
+            let id = self.detach_one(ci, t, new_ids.map(|ids| ids[i].as_str()), *k)?;
+            let title = asset.info.audio_stream(*k).map(|s| s.title).filter(|t| !t.is_empty()).map(|t| format!(" {t:?}")).unwrap_or_default();
+            done.push(format!("stream {k}{title} → {id} on {t}"));
+        }
+        self.summary = format!(
+            "Gave {} sound stream(s) of {clip} their own linked clips: {}{}",
+            list.len(),
+            done.join(", "),
+            if is_video { format!(" ({clip}'s own sound is muted)") } else { String::new() }
+        );
+        Ok(())
+    }
+
+    fn set_audio_stream(&mut self, clip: &str, stream: u32) -> Result<(), EditError> {
+        let ci = editable(self.p, clip)?;
+        let c = &self.p.clips[ci];
+        let Some(asset) = media_of(self.p, c) else {
+            return fail(format!("{clip} is a {} clip; only media clips play a sound stream.", kind_word(c)));
+        };
+        if asset.kind == MediaKind::Image {
+            return fail(format!("{clip} shows a still image; it has no sound stream."));
+        }
+        if let Some(why) = stream_problem(asset, stream) {
+            return fail(why);
+        }
+        let label = asset.info.audio_stream(stream).map(|s| s.describe()).unwrap_or_default();
+        let before = clip_stream(c);
+        let also: Vec<Id> = super::linked_partners(self.p, clip)
+            .into_iter()
+            .filter(|k| self.p.clips.iter().any(|x| &x.id == k && clip_stream(x) == stream && !x.muted && x.enabled))
+            .collect();
+        if let Source::Media { stream: s, .. } = &mut self.p.clips[ci].source {
+            *s = stream;
+        }
+        if !also.is_empty() && !self.p.clips[ci].muted && before != stream {
+            self.warn(format!("{} already play(s) stream {stream} too, so it is heard twice; mute one of them or pick another stream.", also.join(", ")));
+        }
+        self.summary = if before == stream {
+            format!("{clip} already plays sound stream {stream}")
+        } else {
+            format!("{clip} now plays sound stream {stream}{}", if label.is_empty() { String::new() } else { format!(" ({label})") })
+        };
         Ok(())
     }
 

@@ -120,6 +120,14 @@ pub(crate) fn media_of<'a>(p: &'a Project, c: &Clip) -> Option<&'a MediaAsset> {
     }
 }
 
+/// The sound stream a media clip plays (0 for everything else).
+pub(crate) fn clip_stream(c: &Clip) -> u32 {
+    match &c.source {
+        Source::Media { stream, .. } => *stream,
+        _ => 0,
+    }
+}
+
 pub(crate) fn kind_word(c: &Clip) -> &'static str {
     match &c.source {
         Source::Media { .. } => "media",
@@ -147,17 +155,38 @@ pub(crate) fn leader_of(p: &Project, id: &str) -> Id {
     id.to_string()
 }
 
+/// Why `stream` is not a sound stream of `m` (stream 0 is always accepted: it is what every clip
+/// plays by default, and files without sound simply play nothing).
+pub(crate) fn stream_problem(m: &MediaAsset, stream: u32) -> Option<String> {
+    if stream == 0 {
+        return None;
+    }
+    let n = m.info.audio_stream_count();
+    if (stream as usize) < n {
+        return None;
+    }
+    let name = util::file_name(&m.path);
+    Some(match n {
+        0 => format!("{} \"{name}\" has no sound, so it has no sound stream {stream}; use stream 0 (the default).", m.id),
+        1 => format!(
+            "{} \"{name}\" has one sound stream (stream 0), not stream {stream}. If the file has more, its info is from before AIFrames read every stream: import the file again to refresh it.",
+            m.id
+        ),
+        n => format!("{} \"{name}\" has {n} sound streams (0–{}), not stream {stream}.", m.id, n - 1),
+    })
+}
+
 /// Clips linked to `id`: same media, same in-point/duration/speed, anchored `with` it at offset 0
 /// (what `detach_audio` creates). Split, trim, slip, speed and delete keep them in sync.
 pub(crate) fn linked_of(p: &Project, id: &str) -> Vec<Id> {
     let Some(c) = p.clips.iter().find(|c| c.id == id) else { return vec![] };
-    let Source::Media { asset, in_point } = &c.source else { return vec![] };
+    let Source::Media { asset, in_point, .. } = &c.source else { return vec![] };
     p.clips
         .iter()
         .filter(|k| {
             k.id != id
                 && matches!(&k.start, Time::Anchored(Anchor { to: AnchorTarget::With(t), offset }) if t == id && offset.abs() < EPS)
-                && matches!(&k.source, Source::Media { asset: a2, in_point: i2 } if a2 == asset && (i2 - in_point).abs() < 1e-6)
+                && matches!(&k.source, Source::Media { asset: a2, in_point: i2, .. } if a2 == asset && (i2 - in_point).abs() < 1e-6)
                 && (k.duration - c.duration).abs() < 1e-6
                 && k.speed == c.speed
                 && k.reverse == c.reverse
@@ -1121,7 +1150,7 @@ impl Cx<'_> {
 /// Rest of the media (at constant speed) for media clips; 3 s for stills, text and generators.
 pub(crate) fn default_duration(p: &Project, source: &Source, speed: &Param) -> Result<f64, EditError> {
     match source {
-        Source::Media { asset, in_point } => {
+        Source::Media { asset, in_point, .. } => {
             let m = &p.media[media_ix(p, asset)?];
             if m.kind == MediaKind::Image {
                 return Ok(3.0);
@@ -1381,9 +1410,12 @@ pub(crate) fn clip_problems(p: &Project, c: &Clip) -> Vec<(String, String)> {
         out.push(("params".to_string(), format!("{id}: {path} has an invalid value.")));
     }
     match &c.source {
-        Source::Media { asset, in_point } => match p.media.iter().find(|m| &m.id == asset) {
+        Source::Media { asset, in_point, stream } => match p.media.iter().find(|m| &m.id == asset) {
             None => out.push(("media".to_string(), media_ix(p, asset).err().map(|e| format!("{id}: {}", e.message)).unwrap_or_default())),
             Some(m) => {
+                if let Some(why) = stream_problem(m, *stream) {
+                    out.push(("stream".to_string(), format!("{id}: {why}")));
+                }
                 if !in_point.is_finite() {
                     out.push(("media".to_string(), format!("{id} has an in_point that is not a number.")));
                 } else if m.kind != MediaKind::Image && m.info.duration > 0.0 {

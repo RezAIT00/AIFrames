@@ -226,7 +226,7 @@ pub(crate) fn audit_joins(s: &Arc<Services>, args: &J) -> ToolResult {
             }
         }
         let list = joins(p, r, track.as_deref(), from, to);
-        let mut paths: HashMap<Id, PathBuf> = HashMap::new();
+        let mut paths: HashMap<Id, (PathBuf, u32)> = HashMap::new();
         let mut transcripts: HashMap<Id, Vec<Word>> = HashMap::new();
         for j in &list {
             for a in [&j.out, &j.inn].into_iter().flatten().map(|s| &s.asset) {
@@ -236,9 +236,10 @@ pub(crate) fn audit_joins(s: &Arc<Services>, args: &J) -> ToolResult {
                     }
                 }
                 // Offline media has no levels; its joins are still checked against the transcript.
+                // Levels come from the stream the words were heard in.
                 if !paths.contains_key(a) {
                     if let Ok(path) = asset_path(&g.doc, a) {
-                        paths.insert(a.clone(), path);
+                        paths.insert(a.clone(), (path, p.transcripts.get(a).map(|t| t.stream).unwrap_or(0)));
                     }
                 }
             }
@@ -247,8 +248,8 @@ pub(crate) fn audit_joins(s: &Arc<Services>, args: &J) -> ToolResult {
     })?;
     // Levels are read outside the project lock (the first read of a file decodes it).
     let mut waves: HashMap<Id, std::sync::Arc<Waveform>> = HashMap::new();
-    for (a, path) in &paths {
-        if let Ok(w) = s.pool.waveform(path) {
+    for (a, (path, stream)) in &paths {
+        if let Ok(w) = s.pool.waveform_stream(path, *stream) {
             waves.insert(a.clone(), w);
         }
     }
@@ -494,9 +495,9 @@ pub(crate) fn trim_to_words(s: &Arc<Services>, args: &J) -> ToolResult {
         }
         let len = p.media.iter().find(|m| &m.id == asset).map(|m| m.info.duration).unwrap_or(f64::INFINITY);
         let path: Option<PathBuf> = if crate::actions::has_sound(p, asset) { asset_path(&g.doc, asset).ok() } else { None };
-        Ok((path, t.words.clone(), len))
+        Ok((path.map(|x| (x, t.stream)), t.words.clone(), len))
     })?;
-    let wave = path.and_then(|p| s.pool.waveform(&p).ok()).filter(|w| !w.is_empty());
+    let wave = path.and_then(|(p, k)| s.pool.waveform_stream(&p, k).ok()).filter(|w| !w.is_empty());
     let ws = words[from].start;
     let we = words[from..=to].iter().map(|w| w.end).fold(f64::MIN, f64::max);
     let measured = wave.as_ref().and_then(|w| aiframes_media::cut_edges(w, &words, from, to, pad));

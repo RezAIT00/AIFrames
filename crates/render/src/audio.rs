@@ -74,9 +74,9 @@ impl Mixer<'_> {
         Ok(())
     }
 
-    /// The decoded sound of a clip, if it has any.
+    /// The decoded sound of a clip (the sound stream it plays), if it has any.
     fn clip_audio(&self, clip: &Clip) -> Result<Option<Arc<AudioData>>, RenderError> {
-        let Source::Media { asset, .. } = &clip.source else { return Ok(None) };
+        let Source::Media { asset, stream, .. } = &clip.source else { return Ok(None) };
         if clip.muted || !clip.enabled {
             return Ok(None);
         }
@@ -90,7 +90,7 @@ impl Mixer<'_> {
             _ => {}
         }
         let path = self.doc_dir.join(&a.path);
-        match self.rd.pool().audio(&path, self.rate) {
+        match self.rd.pool().audio_stream(&path, self.rate, *stream) {
             Ok(d) => {
                 // Export (strict) always mixes complete, exact audio; playback reads what is decoded
                 // (reads of samples still decoding wait briefly inside the pool).
@@ -103,10 +103,12 @@ impl Mixer<'_> {
                 Ok(Some(d))
             }
             Err(e) => {
-                let err = if path.exists() {
-                    RenderError::Media(e)
-                } else {
+                let err = if !path.exists() {
                     RenderError::Missing(format!("media file {} (clip {}) is offline", path.display(), clip.id))
+                } else if *stream > 0 {
+                    RenderError::Missing(format!("clip {} plays sound stream {stream} of {}: {e}", clip.id, a.id))
+                } else {
+                    RenderError::Media(e)
                 };
                 self.problem(err)?;
                 Ok(None)
@@ -308,14 +310,14 @@ pub(crate) fn soft_clip(x: f32) -> f32 {
 fn track_signature(m: &Mixer, info: &TrackInfo) -> u64 {
     let mut h = KeyHasher::new("duck-trigger");
     h.json(info.track).u64(m.rate as u64).str(&m.doc_dir.to_string_lossy());
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen: Vec<(&str, u32)> = Vec::new();
     for (c, s) in &info.clips {
         h.json(*c).f64(s.start).f64(s.end);
-        if let Source::Media { asset, .. } = &c.source {
+        if let Source::Media { asset, stream, .. } = &c.source {
             if let Some(a) = m.tl.assets.get(asset.as_str()) {
                 h.json(*a);
-                if !seen.contains(&asset.as_str()) {
-                    seen.push(asset.as_str());
+                if !seen.contains(&(asset.as_str(), *stream)) {
+                    seen.push((asset.as_str(), *stream));
                     // The file itself: a replaced voice-over must not reuse the old levels.
                     let path = m.doc_dir.join(&a.path);
                     if let Ok(md) = std::fs::metadata(&path) {
@@ -323,7 +325,7 @@ fn track_signature(m: &Mixer, info: &TrackInfo) -> u64 {
                         h.u64(md.len()).u64(mtime);
                     }
                     // And the decoded audio the pool serves (a new file version is a new `AudioData`).
-                    if let Ok(data) = m.rd.pool().audio(&path, m.rate) {
+                    if let Ok(data) = m.rd.pool().audio_stream(&path, m.rate, *stream) {
                         h.u64(Arc::as_ptr(&data) as usize as u64);
                     }
                 }
@@ -450,13 +452,13 @@ pub(crate) fn decode_all_sources(rd: &Renderer, doc_dir: &Path, p: &Project, r: 
     use rayon::prelude::*;
     let tl = Timeline::new(p, r);
     let rate = rate_of(p);
-    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut paths: Vec<(std::path::PathBuf, u32)> = Vec::new();
     for info in &tl.tracks {
         if !tl.plays_sound(info.track) {
             continue;
         }
         for (c, _) in &info.clips {
-            let Source::Media { asset, .. } = &c.source else { continue };
+            let Source::Media { asset, stream, .. } = &c.source else { continue };
             if c.muted || !c.enabled {
                 continue;
             }
@@ -464,9 +466,9 @@ pub(crate) fn decode_all_sources(rd: &Renderer, doc_dir: &Path, p: &Project, r: 
             if a.kind == MediaKind::Image || (a.kind == MediaKind::Video && !a.info.has_audio) {
                 continue;
             }
-            let path = doc_dir.join(&a.path);
-            if !paths.contains(&path) {
-                paths.push(path);
+            let key = (doc_dir.join(&a.path), *stream);
+            if !paths.contains(&key) {
+                paths.push(key);
             }
         }
     }
@@ -478,7 +480,8 @@ pub(crate) fn decode_all_sources(rd: &Renderer, doc_dir: &Path, p: &Project, r: 
             RenderError::Missing(format!("media file {} is offline", path.display()))
         }
     };
-    let started: Vec<Result<Arc<AudioData>, RenderError>> = paths.par_iter().map(|path| rd.pool().audio(path, rate).map_err(|e| offline(path, e))).collect();
+    let started: Vec<Result<Arc<AudioData>, RenderError>> =
+        paths.par_iter().map(|(path, stream)| rd.pool().audio_stream(path, rate, *stream).map_err(|e| offline(path, e))).collect();
     for a in started {
         a?.wait_complete().map_err(RenderError::Media)?;
     }

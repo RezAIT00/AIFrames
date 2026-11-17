@@ -40,7 +40,7 @@ pub fn demo_transcript() -> Transcript {
             words.push(Word { text, start, end: start + 0.45, conf: 1.0 });
         }
     }
-    Transcript { language: "en".into(), words }
+    Transcript { language: "en".into(), words, ..Default::default() }
 }
 
 fn ffmpeg_cmd() -> Result<Command, String> {

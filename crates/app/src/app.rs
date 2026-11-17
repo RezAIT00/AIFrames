@@ -1035,6 +1035,13 @@ impl AiFramesApp {
                 Ok(_) => self.status = format!("Transcribing {asset}…"),
                 Err(e) => self.toast(ToastKind::Error, format!("Transcribe: {e}")),
             },
+            UiAction::TranscribeStream(asset, stream) => {
+                let opts = aiframes_media::TranscribeOptions { stream: Some(stream), ..Default::default() };
+                match actions::start_transcribe_with(&self.services, id, &asset, "user", opts) {
+                    Ok(_) => self.status = format!("Transcribing {asset} (stream {})…", stream + 1),
+                    Err(e) => self.toast(ToastKind::Error, format!("Transcribe: {e}")),
+                }
+            }
             UiAction::Status(s) => self.status = s,
             UiAction::AskAi { prompt, ids } => {
                 self.side_tab = SideTab::Ai;

@@ -70,8 +70,8 @@ pub fn project_with_voice() -> Project {
             conf: 1.0,
         })
         .collect();
-    p.transcripts.insert("m1".into(), Transcript { language: "en".into(), words: words.clone() });
-    p.transcripts.insert("mv".into(), Transcript { language: "en".into(), words });
+    p.transcripts.insert("m1".into(), Transcript { language: "en".into(), words: words.clone(), ..Default::default() });
+    p.transcripts.insert("mv".into(), Transcript { language: "en".into(), words, ..Default::default() });
     p
 }
 
@@ -108,7 +108,7 @@ pub fn text_clip(id: &str, track: &str, start: Time, duration: f64) -> Clip {
 }
 
 pub fn media_clip(id: &str, track: &str, asset: &str, start: Time, duration: f64, in_point: f64) -> Clip {
-    base_clip(id, track, start, duration, Source::Media { asset: asset.into(), in_point })
+    base_clip(id, track, start, duration, Source::Media { asset: asset.into(), in_point, stream: 0 })
 }
 
 pub fn after(id: &str, offset: f64) -> Time {

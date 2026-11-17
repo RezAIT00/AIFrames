@@ -87,8 +87,10 @@ pub struct PoolStats {
     pub cache_low_priority_bytes: usize,
 }
 
-/// Decoded audio by (file, rate), with a last-use tick.
-type AudioMap = HashMap<(u64, u32), (Arc<AudioData>, u64)>;
+/// Decoded audio by (file, rate, sound stream), with a last-use tick.
+type AudioMap = HashMap<(u64, u32, u32), (Arc<AudioData>, u64)>;
+/// Waveforms by (file, sound stream), with a last-use tick.
+type WaveMap = HashMap<(u64, u32), (Arc<Waveform>, u64)>;
 
 /// Sessions kept per (file, output size) pair.
 const MAX_PER_KEY: usize = 3;
@@ -205,9 +207,9 @@ pub struct MediaPool {
     probes: Mutex<HashMap<u64, Arc<Probed>>>,
     probe_inflight: Inflight<u64, Arc<Probed>>,
     audio: Mutex<AudioMap>,
-    audio_inflight: Inflight<(u64, u32), Arc<AudioData>>,
-    waves: Mutex<HashMap<u64, (Arc<Waveform>, u64)>>,
-    wave_inflight: Inflight<u64, Arc<Waveform>>,
+    audio_inflight: Inflight<(u64, u32, u32), Arc<AudioData>>,
+    waves: Mutex<WaveMap>,
+    wave_inflight: Inflight<(u64, u32), Arc<Waveform>>,
     image_inflight: Inflight<(u64, u32, u32), Frame>,
     thumb_inflight: Inflight<(u64, u32, i64), Frame>,
     thumb_gate: Gate,
@@ -939,6 +941,7 @@ impl MediaPool {
     /// The file's audio as stereo f32 at `rate`, decoded once into the disk cache
     /// (`<cache>\audio\`, keyed by path + size + mtime + rate) and read on demand. Mono plays on
     /// both channels at unity gain; surround is downmixed. Files without audio give silence.
+    /// This is the first sound stream; [`MediaPool::audio_stream`] reads the others.
     ///
     /// Returns at once for long files not cached yet: the decode runs in the background, reads
     /// wait up to 150 ms for samples still being decoded (`AudioData::read_frames_wait` to choose),
@@ -947,16 +950,24 @@ impl MediaPool {
     /// decoded completely before this returns (that takes milliseconds). If a background decode
     /// failed, the next call returns its error (and retries the decode after that).
     pub fn audio(&self, path: &Path, rate: u32) -> Result<Arc<AudioData>> {
+        self.audio_stream(path, rate, 0)
+    }
+
+    /// Like [`MediaPool::audio`] for sound stream `stream` of a file with several (0-based among
+    /// its sound streams; OBS game/mic/chat tracks, a camera's two mics). Each stream has its own
+    /// cache file. A stream the file does not have is an error.
+    pub fn audio_stream(&self, path: &Path, rate: u32, stream: u32) -> Result<Arc<AudioData>> {
         if !(1000..=768_000).contains(&rate) {
             return Err(MediaError::InvalidInput(format!("unsupported sample rate {rate} Hz (use 8000..768000)")));
         }
         let (fk, p) = self.lookup(path)?;
+        let key = (fk.id, rate, stream);
         let tick = self.tick.fetch_add(1, Ordering::Relaxed);
         {
             let mut m = lock(&self.audio);
-            if let Some((a, t)) = m.get_mut(&(fk.id, rate)) {
+            if let Some((a, t)) = m.get_mut(&key) {
                 if let Some(e) = a.error() {
-                    m.remove(&(fk.id, rate));
+                    m.remove(&key);
                     return Err(e);
                 }
                 *t = tick;
@@ -964,8 +975,8 @@ impl MediaPool {
             }
         }
         let dir = self.cache_dir.join("audio");
-        let a = self.audio_inflight.run((fk.id, rate), || {
-            let a = Arc::new(audio::open_or_start(path, &p, &fk, rate, &dir)?);
+        let a = self.audio_inflight.run(key, || {
+            let a = Arc::new(audio::open_or_start(path, &p, &fk, rate, &dir, stream)?);
             if !a.is_complete() && decode_synchronously(p.info.duration) {
                 a.wait_complete()?;
             }
@@ -977,13 +988,18 @@ impl MediaPool {
                 m.remove(&k);
             }
         }
-        m.insert((fk.id, rate), (a.clone(), tick));
+        m.insert(key, (a.clone(), tick));
         Ok(a)
     }
 
     /// `audio`, then waits until the whole file is decoded (what export needs: complete, exact audio).
     pub fn audio_complete(&self, path: &Path, rate: u32) -> Result<Arc<AudioData>> {
-        let a = self.audio(path, rate)?;
+        self.audio_complete_stream(path, rate, 0)
+    }
+
+    /// [`MediaPool::audio_complete`] of sound stream `stream`.
+    pub fn audio_complete_stream(&self, path: &Path, rate: u32, stream: u32) -> Result<Arc<AudioData>> {
+        let a = self.audio_stream(path, rate, stream)?;
         a.wait_complete()?;
         Ok(a)
     }
@@ -991,30 +1007,49 @@ impl MediaPool {
     /// Non-blocking start of the file's audio decode, prioritising `start_sec` (call on seek or
     /// before Play so the first `mix` finds its samples ready).
     pub fn prefetch_audio(&self, path: &Path, rate: u32, start_sec: f64) -> Result<Arc<AudioData>> {
-        let a = self.audio(path, rate)?;
+        self.prefetch_audio_stream(path, rate, 0, start_sec)
+    }
+
+    /// [`MediaPool::prefetch_audio`] of sound stream `stream`.
+    pub fn prefetch_audio_stream(&self, path: &Path, rate: u32, stream: u32, start_sec: f64) -> Result<Arc<AudioData>> {
+        let a = self.audio_stream(path, rate, stream)?;
         a.prefetch(start_sec);
         Ok(a)
     }
 
     /// Min/max/RMS peaks at ~200 bins per second for drawing, cached on disk
-    /// (`<cache>\waveform\`). Computed from the 48 kHz audio cache.
+    /// (`<cache>\waveform\`). Computed from the 48 kHz audio cache. The first sound stream;
+    /// [`MediaPool::waveform_stream`] draws the others.
     pub fn waveform(&self, path: &Path) -> Result<Arc<Waveform>> {
+        self.waveform_stream(path, 0)
+    }
+
+    /// [`MediaPool::waveform`] of sound stream `stream` (each stream has its own cache).
+    pub fn waveform_stream(&self, path: &Path, stream: u32) -> Result<Arc<Waveform>> {
         let (fk, p) = self.lookup(path)?;
+        let key = (fk.id, stream);
         let tick = self.tick.fetch_add(1, Ordering::Relaxed);
-        if let Some((w, t)) = lock(&self.waves).get_mut(&fk.id) {
+        if let Some((w, t)) = lock(&self.waves).get_mut(&key) {
             *t = tick;
             return Ok(w.clone());
         }
-        let w = self.wave_inflight.run(fk.id, || {
+        let w = self.wave_inflight.run(key, || {
             if !p.info.has_audio {
+                if stream > 0 {
+                    return Err(p.no_stream(path, stream));
+                }
                 return Ok(Arc::new(Waveform::empty(p.info.duration)));
             }
+            if p.audio(stream).is_none() {
+                return Err(p.no_stream(path, stream));
+            }
             let dir = self.cache_dir.join("waveform");
-            let file = dir.join(cache_name(path, &fk, ".wf"));
+            let suffix = if stream == 0 { ".wf".to_string() } else { format!("-s{stream}.wf") };
+            let file = dir.join(cache_name(path, &fk, &suffix));
             if let Some(w) = Waveform::load(&file) {
                 return Ok(Arc::new(w));
             }
-            let a = self.audio(path, 48_000)?;
+            let a = self.audio_stream(path, 48_000, stream)?;
             a.wait_complete()?;
             let w = Waveform::from_audio(&a);
             if ensure_dir(&dir).is_ok() {
@@ -1028,7 +1063,7 @@ impl MediaPool {
                 m.remove(&k);
             }
         }
-        m.insert(fk.id, (w.clone(), tick));
+        m.insert(key, (w.clone(), tick));
         Ok(w)
     }
 
@@ -1069,8 +1104,8 @@ impl MediaPool {
         for id in ids {
             lock(&self.cache).remove_file(id);
             lock(&self.probes).remove(&id);
-            lock(&self.audio).retain(|(f, _), _| *f != id);
-            lock(&self.waves).remove(&id);
+            lock(&self.audio).retain(|(f, _, _), _| *f != id);
+            lock(&self.waves).retain(|(f, _), _| *f != id);
             lock(&self.ends).remove(&id);
             let slots: Vec<Arc<Slot>> = {
                 let mut g = lock(&self.groups);

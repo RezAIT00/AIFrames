@@ -73,6 +73,9 @@ struct State {
     waves: HashMap<PathBuf, Wave>,
     queue: VecDeque<(PathBuf, i64)>,
     wave_queue: VecDeque<PathBuf>,
+    /// Waveforms of the other sound streams (files with several), by (file, stream >= 1).
+    stream_waves: HashMap<(PathBuf, u32), Wave>,
+    stream_wave_queue: VecDeque<(PathBuf, u32)>,
     tick: u64,
     stop: bool,
 }
@@ -128,6 +131,7 @@ impl Previews {
             st.ready -= n.min(st.ready);
         }
         st.waves.remove(path);
+        st.stream_waves.retain(|(p, _), _| p != path);
     }
 
     /// Loads waveforms for these files in the background (used when a project opens).
@@ -212,6 +216,28 @@ impl aiframes_ui::MediaPreview for Previews {
             None => {
                 st.waves.insert(path.clone(), Wave::Loading);
                 st.wave_queue.push_back(path);
+                drop(st);
+                self.inner.cv.notify_all();
+                None
+            }
+        }
+    }
+
+    fn waveform_stream(&self, asset: &MediaAsset, stream: u32) -> Option<Arc<Waveform>> {
+        if stream == 0 {
+            return self.waveform(asset);
+        }
+        if asset.kind == MediaKind::Image || (stream as usize) >= asset.info.audio_stream_count() {
+            return None;
+        }
+        let key = (self.path(asset), stream);
+        let mut st = lock(&self.inner.st);
+        match st.stream_waves.get(&key) {
+            Some(Wave::Ready(w)) => Some(w.clone()),
+            Some(_) => None,
+            None => {
+                st.stream_waves.insert(key.clone(), Wave::Loading);
+                st.stream_wave_queue.push_back(key);
                 drop(st);
                 self.inner.cv.notify_all();
                 None
@@ -306,23 +332,30 @@ fn evict(st: &mut State) {
 
 fn wave_worker(inner: Arc<Inner>) {
     loop {
-        let path = {
+        let (path, stream) = {
             let mut st = lock(&inner.st);
             loop {
                 if st.stop {
                     return;
                 }
                 if let Some(p) = st.wave_queue.pop_front() {
-                    break p;
+                    break (p, 0);
+                }
+                if let Some(k) = st.stream_wave_queue.pop_front() {
+                    break k;
                 }
                 st = inner.cv.wait(st).unwrap_or_else(|e| e.into_inner());
             }
         };
-        let w = match inner.pool.waveform(&path) {
+        let w = match inner.pool.waveform_stream(&path, stream) {
             Ok(w) => Wave::Ready(w),
             Err(_) => Wave::Failed,
         };
-        lock(&inner.st).waves.insert(path, w);
+        if stream == 0 {
+            lock(&inner.st).waves.insert(path, w);
+        } else {
+            lock(&inner.st).stream_waves.insert((path, stream), w);
+        }
         inner.ctx.request_repaint();
     }
 }

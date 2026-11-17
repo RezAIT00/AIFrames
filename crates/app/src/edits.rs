@@ -141,14 +141,23 @@ pub fn add_track_op(kind: TrackKind, id: Option<Id>) -> Option<Op> {
     }
 }
 
-/// Media dropped on the viewer: a new track on top with the clip at `at`.
+/// The `detach_streams` op that gives a fresh clip `clip` of a file with several sound streams one
+/// linked audio clip per stream (nothing for the usual single-stream file).
+fn streams_op(p: &Project, asset: &str, clip: &str) -> Option<Op> {
+    aiframes_ui::edits::has_streams(p, asset).then(|| Op::DetachStreams { clip: clip.into(), streams: None, tracks: None, new_ids: None })
+}
+
+/// Media dropped on the viewer: a new track on top with the clip at `at` (plus one linked audio
+/// clip per sound stream for files with several).
 pub fn drop_on_viewer_ops(p: &Project, asset: &str, at: f64) -> Vec<Op> {
     let Some(m) = p.media.iter().find(|m| m.id == asset) else { return Vec::new() };
     let audio = m.kind == MediaKind::Audio;
     let tid = new_track_id(p, if audio { "a" } else { "v" });
+    let cid = aiframes_ui::edits::fresh_ids(p, "c", 1).remove(0);
     let mut ops = Vec::new();
     ops.extend(add_track_op(if audio { TrackKind::Audio } else { TrackKind::Video }, Some(tid.clone())));
-    ops.extend(op(json!({"op": "add_clip", "clip": {"track": tid, "asset": asset, "start": at.max(0.0)}})));
+    ops.extend(op(json!({"op": "add_clip", "clip": {"id": cid, "track": tid, "asset": asset, "start": at.max(0.0)}})));
+    ops.extend(streams_op(p, asset, &cid));
     ops
 }
 
@@ -161,11 +170,18 @@ pub fn place_ops(p: &Project, r: &Resolved, assets: &[(Id, MediaKind, f64)], at:
     let mut added: Vec<(Id, f64, f64)> = Vec::new();
     let mut created: Vec<(TrackKind, Id)> = Vec::new();
     let mut t = at.max(0.0);
+    // Clips of files with several sound streams get ids, so their streams can be linked to them.
+    // Those `detach_streams` ops go last: the tracks they add take fresh ids, which must not be
+    // the ids this batch hands out up front.
+    let mut later: Vec<Op> = Vec::new();
+    let mut clip_ids = aiframes_ui::edits::fresh_ids(p, "c", assets.len()).into_iter();
     for (id, kind, dur) in assets {
         let len = if *dur > 0.0 { *dur } else { 3.0 };
         let tk = if *kind == MediaKind::Audio { TrackKind::Audio } else { TrackKind::Video };
+        let cid = clip_ids.next().unwrap_or_default();
         if let Some(tr) = target.and_then(|t| p.tracks.iter().find(|x| x.id == t && x.kind == tk && !x.locked)) {
-            ops.extend(op(json!({"op": "add_clip", "clip": {"track": tr.id, "asset": id, "start": t}, "overwrite": true})));
+            ops.extend(op(json!({"op": "add_clip", "clip": {"id": cid, "track": tr.id, "asset": id, "start": t}, "overwrite": true})));
+            later.extend(streams_op(p, id, &cid));
             added.push((tr.id.clone(), t, t + len));
             t += len;
             continue;
@@ -188,10 +204,12 @@ pub fn place_ops(p: &Project, r: &Resolved, assets: &[(Id, MediaKind, f64)], at:
                 }
             },
         };
-        ops.extend(op(json!({"op": "add_clip", "clip": {"track": track, "asset": id, "start": t}})));
+        ops.extend(op(json!({"op": "add_clip", "clip": {"id": cid, "track": track, "asset": id, "start": t}})));
+        later.extend(streams_op(p, id, &cid));
         added.push((track, t, t + len));
         t += len;
     }
+    ops.extend(later);
     ops
 }
 
@@ -207,7 +225,19 @@ pub fn detach_audio_ops(p: &Project, r: &Resolved, ids: &[Id]) -> Vec<Op> {
         .map(|t| (t.id.clone(), r.on_track(p, &t.id).into_iter().map(|(_, s)| s).collect()))
         .collect();
     let mut new_track: Option<Id> = None;
+    let mut multi: Vec<Op> = Vec::new();
     for c in p.clips.iter().filter(|c| ids.contains(&c.id)) {
+        // Several sound streams: each not detached yet gets its own linked clip and track.
+        if let Source::Media { asset, .. } = &c.source {
+            let n = p.media.iter().find(|m| &m.id == asset).filter(|m| m.kind == MediaKind::Video).map(|m| m.info.audio_stream_count()).unwrap_or(0);
+            if n > 1 {
+                // Last in the batch: the tracks it adds take fresh ids (see `place_ops`).
+                if aiframes_core::linked_clips(p, &c.id).len() < n {
+                    multi.push(Op::DetachStreams { clip: c.id.clone(), streams: None, tracks: None, new_ids: None });
+                }
+                continue;
+            }
+        }
         let has_sound = match &c.source {
             Source::Media { asset, .. } => p.media.iter().find(|m| &m.id == asset).is_some_and(|m| m.kind == MediaKind::Video && m.info.has_audio),
             _ => false,
@@ -235,6 +265,7 @@ pub fn detach_audio_ops(p: &Project, r: &Resolved, ids: &[Id]) -> Vec<Op> {
         };
         ops.extend(op(json!({"op": "detach_audio", "clip": c.id, "track": track})));
     }
+    ops.extend(multi);
     ops
 }
 

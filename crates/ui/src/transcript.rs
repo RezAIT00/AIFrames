@@ -180,7 +180,7 @@ impl WordSel {
             .media
             .iter()
             .find(|m| m.id == self.asset)
-            .and_then(|m| preview.waveform(m))
+            .and_then(|m| preview.waveform_stream(m, p.transcripts.get(&self.asset).map(|t| t.stream).unwrap_or(0)))
             .zip(p.transcripts.get(&self.asset))
             .and_then(|(w, t)| aiframes_media::cut_edges(&w, &t.words, from, to, aiframes_core::ops::DEFAULT_WORD_PAD))
             .map(|e| [e.start.t, e.end.t]);
@@ -535,9 +535,9 @@ mod tests {
                 Word { text: format!(" w{i}"), start: s, end: s + 0.4, conf: if i == 3 { 0.4 } else { 1.0 } }
             })
             .collect();
-        p.transcripts.insert("ma".into(), Transcript { language: "en".into(), words });
+        p.transcripts.insert("ma".into(), Transcript { language: "en".into(), words, ..Default::default() });
         // c3 plays ma 0–20; make it play source 1–9 instead.
-        p.clips[2].source = Source::Media { asset: "ma".into(), in_point: 1.0 };
+        p.clips[2].source = Source::Media { asset: "ma".into(), in_point: 1.0, stream: 0 };
         p.clips[2].duration = 8.0;
         p
     }

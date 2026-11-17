@@ -239,11 +239,14 @@ impl MediaBin {
         let weak = ui.visuals().weak_text_color();
         let tp = ui.painter_at(Rect::from_min_size(pos2(rect.left(), thumb.bottom()), vec2(w, 32.0)));
         tp.text(pos2(rect.left() + 2.0, thumb.bottom() + 4.0), Align2::LEFT_TOP, util::media_name(m), FontId::proportional(11.5), strong);
-        let info = match m.kind {
+        let mut info = match m.kind {
             MediaKind::Audio => format!("{} Hz · {} ch", m.info.audio_rate, m.info.audio_channels),
             _ if m.info.width > 0 => format!("{}×{}{}", m.info.width, m.info.height, if m.info.fps > 0.0 { format!(" · {} fps", trim(m.info.fps)) } else { String::new() }),
             _ => String::new(),
         };
+        if m.info.audio_streams.len() > 1 {
+            info.push_str(&format!(" · {} audio", m.info.audio_streams.len()));
+        }
         tp.text(pos2(rect.left() + 2.0, thumb.bottom() + 18.0), Align2::LEFT_TOP, info, FontId::proportional(10.0), weak);
         resp
     }
@@ -269,7 +272,12 @@ impl MediaBin {
         let mut cx_ = x + 34.0 + name_w;
         let cols = [
             if m.kind == MediaKind::Image { "still".to_string() } else { util::duration_label(m.info.duration) },
-            if m.info.width > 0 { format!("{}×{}", m.info.width, m.info.height) } else { format!("{} Hz", m.info.audio_rate) },
+            match (m.info.width > 0, m.info.audio_streams.len()) {
+                (true, n) if n > 1 => format!("{}×{} · {n} audio", m.info.width, m.info.height),
+                (true, _) => format!("{}×{}", m.info.width, m.info.height),
+                (false, n) if n > 1 => format!("{n} audio streams"),
+                (false, _) => format!("{} Hz", m.info.audio_rate),
+            },
             if cx.project.transcripts.contains_key(&m.id) { "transcript".into() } else { String::new() },
             match usage(cx.project, &m.id) {
                 0 => String::new(),
@@ -329,7 +337,19 @@ impl MediaBin {
             let has_sound = m.kind == MediaKind::Audio || m.info.has_audio;
             if has_sound {
                 let label = if p.transcripts.contains_key(&m.id) { "Re-transcribe" } else { "Transcribe" };
-                if ui.button(label).clicked() {
+                if m.info.audio_streams.len() > 1 {
+                    // Pick the stream with the speech (the mic of an OBS recording).
+                    ui.menu_button(label, |ui| {
+                        let speech = m.info.speech_stream();
+                        for (k, s) in m.info.audio_streams.iter().enumerate() {
+                            let text = format!("Stream {}: {}{}", k + 1, s.describe(), if k as u32 == speech { "  (speech)" } else { "" });
+                            if ui.button(text).clicked() {
+                                out.push(UiAction::TranscribeStream(m.id.clone(), k as u32));
+                                ui.close();
+                            }
+                        }
+                    });
+                } else if ui.button(label).clicked() {
                     out.push(UiAction::Transcribe(m.id.clone()));
                     ui.close();
                 }

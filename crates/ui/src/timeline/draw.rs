@@ -16,23 +16,23 @@ const ROW_VIDEO: Color32 = rgb(0x1B, 0x1C, 0x20);
 const ROW_AUDIO: Color32 = rgb(0x19, 0x1C, 0x1B);
 const RULER_BG: Color32 = rgb(0x17, 0x18, 0x1B);
 
-/// Waveform pyramids by asset, rebuilt when the app hands out a different waveform.
+/// Waveform pyramids by asset and sound stream, rebuilt when the app hands out a different waveform.
 #[derive(Default)]
 pub(crate) struct WaveCache {
-    map: HashMap<Id, (usize, Arc<WavePyramid>)>,
+    map: HashMap<(Id, u32), (usize, Arc<WavePyramid>)>,
 }
 
 impl WaveCache {
-    pub fn get(&mut self, preview: &dyn MediaPreview, asset: &MediaAsset) -> Option<Arc<WavePyramid>> {
-        let w = preview.waveform(asset)?;
+    pub fn get(&mut self, preview: &dyn MediaPreview, asset: &MediaAsset, stream: u32) -> Option<Arc<WavePyramid>> {
+        let w = preview.waveform_stream(asset, stream)?;
         let key = Arc::as_ptr(&w) as usize;
-        if let Some((k, p)) = self.map.get(&asset.id) {
+        if let Some((k, p)) = self.map.get(&(asset.id.clone(), stream)) {
             if *k == key {
                 return Some(p.clone());
             }
         }
         let p = Arc::new(WavePyramid::new(&w));
-        self.map.insert(asset.id.clone(), (key, p.clone()));
+        self.map.insert((asset.id.clone(), stream), (key, p.clone()));
         Some(p)
     }
 }
@@ -844,7 +844,11 @@ impl Timeline {
     fn waveform(&mut self, pc: &Painter, preview: &dyn MediaPreview, c: &Clip, asset: &MediaAsset, span: Span, area: Rect, lay: &Layout, color: Color32, muted: bool) {
         let mid = area.center().y;
         let half = (area.height() * 0.5 - 1.0).max(1.0);
-        let Some(pyr) = self.waves.get(preview, asset) else {
+        let stream = match &c.source {
+            Source::Media { stream, .. } => *stream,
+            _ => 0,
+        };
+        let Some(pyr) = self.waves.get(preview, asset, stream) else {
             pc.hline(area.x_range(), mid, Stroke::new(1.0, alpha(color, 0.4)));
             return;
         };

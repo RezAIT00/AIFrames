@@ -188,7 +188,7 @@ pub fn import_plan_for(project: &Project, project_file: Option<&Path>, pool: &Me
             if let (Some(m), Ok((_, info))) = (existing.get(&key), pool.probe(&abs)) {
                 if media_info_changed(&m.info, &info) {
                     refreshed.push((m.id.clone(), m.path.clone(), info));
-                    skipped.push((f, "already in the project (the file changed: its info was refreshed)".into()));
+                    skipped.push((f, "already in the project (its stored info was out of date — the file changed, or has sound streams an older AIFrames did not list — and was refreshed)".into()));
                     continue;
                 }
             }
@@ -241,6 +241,8 @@ fn media_info_changed(old: &MediaInfo, new: &MediaInfo) -> bool {
         || old.has_video != new.has_video
         || old.has_audio != new.has_audio
         || (old.fps - new.fps).abs() > 1e-3
+        // Info stored before every sound stream was read lists none: importing again finds them.
+        || old.audio_streams != new.audio_streams
 }
 
 fn strip_verbatim(p: &Path) -> PathBuf {
@@ -257,15 +259,63 @@ pub fn import_ops(doc: &Document, pool: &MediaPool, paths: &[PathBuf]) -> Result
     import_plan(doc, pool, paths).map(|p| p.ops)
 }
 
+/// Which sound streams of a multi-stream file get their own linked audio clip when it is placed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum StreamChoice {
+    /// Every stream (one linked audio clip per stream, each on its own audio track), as Premiere
+    /// and Resolve do. Files with one stream are placed as one clip.
+    #[default]
+    All,
+    /// Only the clip itself, playing the first stream (the old behaviour).
+    First,
+    /// These streams (0-based among the sound streams).
+    List(Vec<u32>),
+}
+
+impl StreamChoice {
+    /// From a tool argument: "all", "first" or a list of stream indexes.
+    pub fn from_arg(v: Option<&serde_json::Value>) -> Result<StreamChoice, String> {
+        match v {
+            None | Some(serde_json::Value::Null) => Ok(StreamChoice::All),
+            Some(serde_json::Value::String(s)) if s.eq_ignore_ascii_case("all") => Ok(StreamChoice::All),
+            Some(serde_json::Value::String(s)) if s.eq_ignore_ascii_case("first") => Ok(StreamChoice::First),
+            Some(serde_json::Value::Array(a)) => a
+                .iter()
+                .map(|x| x.as_u64().filter(|n| *n < 64).map(|n| n as u32).ok_or_else(|| format!("'streams' items must be stream numbers 0–63 (got {x})")))
+                .collect::<Result<Vec<_>, _>>()
+                .map(StreamChoice::List),
+            Some(other) => Err(format!("'streams' must be \"all\", \"first\" or a list of stream numbers like [0, 2] (got {other})")),
+        }
+    }
+
+    /// The op that follows a freshly placed clip `clip` of `info` (None = nothing to detach).
+    pub fn op_for(&self, clip: &str, info: &MediaInfo) -> Result<Option<Op>, String> {
+        let streams = match self {
+            StreamChoice::First => return Ok(None),
+            StreamChoice::All if info.audio_stream_count() <= 1 => return Ok(None),
+            StreamChoice::All => None,
+            StreamChoice::List(v) => Some(v.clone()),
+        };
+        op(json!({"op": "detach_streams", "clip": clip, "streams": streams})).map(Some)
+    }
+}
+
 /// Ops that append the imported assets magnetically to the end of a track: pictures to `track` (or
 /// the main video track), sound-only files to `track` if it is an audio track (or the first audio
-/// track). Missing tracks are created. Returns the ops and the new clip ids.
+/// track). Missing tracks are created. Files with several sound streams get one linked audio clip
+/// per stream (see [`append_ops_with`]). Returns the ops and the new clip ids.
 pub fn append_ops(p: &Project, assets: &[ImportedAsset], track: Option<&str>) -> Result<(Vec<Op>, Vec<Id>), String> {
+    append_ops_with(p, assets, track, &StreamChoice::All)
+}
+
+/// [`append_ops`] choosing which sound streams of multi-stream files get linked audio clips.
+pub fn append_ops_with(p: &Project, assets: &[ImportedAsset], track: Option<&str>, streams: &StreamChoice) -> Result<(Vec<Op>, Vec<Id>), String> {
     let mut ids = IdGen::new(p);
     for a in assets {
         ids.claim(&a.id).map_err(|e| e.message)?;
     }
     let mut ops = Vec::new();
+    let mut later = Vec::new();
     let mut clips = Vec::new();
     let given = match track {
         Some(t) => Some(p.tracks.iter().find(|x| x.id == t).ok_or_else(|| format!("unknown track '{t}'"))?),
@@ -289,8 +339,16 @@ pub fn append_ops(p: &Project, assets: &[ImportedAsset], track: Option<&str>) ->
         };
         let cid = ids.fresh("c");
         ops.push(op(json!({"op": "append_clip", "track": t, "clip": {"id": cid, "asset": a.id}}))?);
+        if a.kind != MediaKind::Image {
+            if let Some(o) = streams.op_for(&cid, &a.info)? {
+                later.push(o);
+            }
+        }
         clips.push(cid);
     }
+    // Last: the clips and tracks `detach_streams` adds take fresh ids, which must not be the ids
+    // handed out above.
+    ops.extend(later);
     Ok((ops, clips))
 }
 
@@ -323,14 +381,26 @@ pub fn start_transcribe_with(s: &Arc<Services>, doc: u64, asset: &str, author: &
 /// ([`crate::LiveState::ai_sessions`]).
 pub fn start_transcribe_by(s: &Arc<Services>, doc: u64, asset: &str, author: &str, mut opts: TranscribeOptions, session: Option<crate::AiSession>) -> Result<u64, String> {
     let d = s.hub.get(doc).ok_or_else(|| format!("project {doc} is not open"))?;
-    let (path, name, kind, has_audio) = {
+    let (path, name, kind, has_audio, info) = {
         let g = suite_hub::lock(&d);
         let m = g.doc.project.media.iter().find(|m| m.id == asset).ok_or_else(|| unknown_asset(&g.doc.project, asset))?;
-        (g.doc.media_path(m), crate::util::file_name(&m.path).to_string(), m.kind, m.info.has_audio)
+        (g.doc.media_path(m), crate::util::file_name(&m.path).to_string(), m.kind, m.info.has_audio, m.info.clone())
     };
     if kind == MediaKind::Image || !has_audio {
         return Err(format!("{asset} ({name}) has no audio to transcribe"));
     }
+    // Files with several sound streams: the caller's stream, else the one with the speech.
+    let streams = info.audio_stream_count();
+    let stream = opts.stream.unwrap_or_else(|| info.speech_stream());
+    if stream as usize >= streams.max(1) {
+        return Err(format!("{asset} ({name}) has {streams} sound stream(s) (0–{}), not stream {stream}", streams.max(1) - 1));
+    }
+    opts.stream = Some(stream);
+    let name = if streams > 1 {
+        format!("{name} (stream {stream}{})", info.audio_stream(stream).map(|s| s.title).filter(|t| !t.is_empty()).map(|t| format!(": {t}")).unwrap_or_default())
+    } else {
+        name
+    };
     if !path.exists() {
         return Err(format!("the file of {asset} is missing: {} (relink it first)", path.display()));
     }
@@ -383,7 +453,7 @@ pub fn start_transcribe_by(s: &Arc<Services>, doc: u64, asset: &str, author: &st
         let who = if author == AI_AUTHOR { "AI".to_string() } else { author.clone() };
         services.hub.notify(format!("{who}: transcribed {name} ({words} words)"));
         services.hub.wake();
-        let mut res = json!({"asset": asset, "file": name, "words": words, "language": language, "revision": receipt.revision, "seconds": t3(started.elapsed().as_secs_f64())});
+        let mut res = json!({"asset": asset, "file": name, "words": words, "language": language, "stream": stream, "revision": receipt.revision, "seconds": t3(started.elapsed().as_secs_f64())});
         if forced || !receipt.warnings.is_empty() {
             res["warnings"] = json!(receipt.warnings);
         }
@@ -817,7 +887,7 @@ mod tests {
             Word { text: " hello".into(), start: 6.0, end: 6.4, conf: 1.0 },
             Word { text: "late".into(), start: 16.0, end: 16.5, conf: 1.0 },
         ];
-        p.transcripts.insert("m1".into(), Transcript { language: "en".into(), words });
+        p.transcripts.insert("m1".into(), Transcript { language: "en".into(), words, ..Default::default() });
         let r = resolve(&p);
         let w = word_places(&p, &r, "m1", None);
         assert_eq!(w[0], None, "before the in-point");

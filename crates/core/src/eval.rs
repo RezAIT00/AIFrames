@@ -653,7 +653,7 @@ mod tests {
             start: Time::At(0.0),
             duration: dur,
             until: None,
-            source: Source::Media { asset: "m1".into(), in_point },
+            source: Source::Media { asset: "m1".into(), in_point, stream: 0 },
             speed,
             reverse,
             transform: Transform::default(),

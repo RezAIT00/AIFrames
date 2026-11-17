@@ -58,7 +58,7 @@ fn parse_json(text: &str) -> Result<Imported, String> {
     let list = v.as_array().or_else(|| v.get("words").and_then(J::as_array));
     if let Some(list) = list {
         let words: Vec<Word> = list.iter().filter_map(json_word).collect();
-        return Ok(Imported { transcript: Transcript { language, words: sorted(words) }, format: "words_json" });
+        return Ok(Imported { transcript: Transcript { language, words: sorted(words), ..Default::default() }, format: "words_json" });
     }
     // openai-whisper: {"segments": [{"start","end","text","words": [...]}]}.
     let segs = v.get("segments").and_then(J::as_array).ok_or("expected a word list, {\"words\": [...]} or whisper JSON with \"segments\"")?;
@@ -72,7 +72,7 @@ fn parse_json(text: &str) -> Result<Imported, String> {
             }
         }
     }
-    Ok(Imported { transcript: Transcript { language, words: sorted(words) }, format: "whisper_json" })
+    Ok(Imported { transcript: Transcript { language, words: sorted(words), ..Default::default() }, format: "whisper_json" })
 }
 
 fn sorted(mut w: Vec<Word>) -> Vec<Word> {
@@ -150,7 +150,7 @@ fn parse_cues(text: &str, format: &'static str) -> Result<Imported, String> {
     if cues == 0 {
         return Err(format!("no {format} cues (lines like \"00:00:01,000 --> 00:00:03,500\") found"));
     }
-    Ok(Imported { transcript: Transcript { language: String::new(), words: sorted(words) }, format })
+    Ok(Imported { transcript: Transcript { language: String::new(), words: sorted(words), ..Default::default() }, format })
 }
 
 /// The transcript sidecar next to a media file, if any: `<stem>.words.json`, `<stem>.json`,

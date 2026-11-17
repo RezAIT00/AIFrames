@@ -318,8 +318,31 @@ pub fn media_clip_len(p: &Project, asset: &str) -> f64 {
     }
 }
 
+/// Whether the asset has several sound streams (an OBS recording with game, mic and chat tracks,
+/// a camera with two mics): placing it then gives every stream its own linked audio clip.
+pub fn has_streams(p: &Project, asset: &str) -> bool {
+    p.media.iter().find(|m| m.id == asset).is_some_and(|m| m.kind != MediaKind::Image && m.info.audio_stream_count() > 1)
+}
+
+/// The clip JSON for a fresh clip of `asset` (`extra` fields merged in) and the ops that follow it:
+/// for a file with several sound streams the clip gets an id and `detach_streams` gives every
+/// stream its own linked audio clip on its own audio track, as Premiere and Resolve do.
+fn placed(p: &Project, asset: &str, extra: Value) -> (Value, Vec<Op>) {
+    let mut clip = json!({"asset": asset});
+    if let (Some(c), Value::Object(x)) = (clip.as_object_mut(), extra) {
+        c.extend(x);
+    }
+    if !has_streams(p, asset) {
+        return (clip, vec![]);
+    }
+    let id = fresh_ids(p, "c", 1).remove(0);
+    clip["id"] = json!(id);
+    (clip, vec![Op::DetachStreams { clip: id, streams: None, tracks: None, new_ids: None }])
+}
+
 /// Media dropped at `t`: on `track` (None = on a new track of the right kind). `insert` = insert
-/// with ripple (pushes later clips), else overwrite what is under it.
+/// with ripple (pushes later clips), else overwrite what is under it. A file with several sound
+/// streams also gets one linked audio clip per stream.
 pub fn drop_media_ops(p: &Project, asset: &str, track: Option<&str>, t: f64, insert: bool) -> Vec<Op> {
     let Some(m) = p.media.iter().find(|m| m.id == asset) else { return vec![] };
     let t = t.max(0.0);
@@ -335,11 +358,17 @@ pub fn drop_media_ops(p: &Project, asset: &str, track: Option<&str>, t: f64, ins
     };
     if insert && !ops.is_empty() {
         // A new track is empty: inserting and adding are the same.
-        ops.push(Op::AddClip { clip: json!({"track": track, "asset": asset, "start": t}), overwrite: false });
+        let (clip, then) = placed(p, asset, json!({"track": track, "start": t}));
+        ops.push(Op::AddClip { clip, overwrite: false });
+        ops.extend(then);
     } else if insert {
-        ops.push(Op::InsertClip { track, at: t, clip: json!({"asset": asset}), ripple: true });
+        let (clip, then) = placed(p, asset, json!({}));
+        ops.push(Op::InsertClip { track, at: t, clip, ripple: true });
+        ops.extend(then);
     } else {
-        ops.push(Op::AddClip { clip: json!({"track": track, "asset": asset, "start": t}), overwrite: true });
+        let (clip, then) = placed(p, asset, json!({"track": track, "start": t}));
+        ops.push(Op::AddClip { clip, overwrite: true });
+        ops.extend(then);
     }
     ops
 }
@@ -358,9 +387,15 @@ pub fn add_media_at_ops(p: &Project, r: &Resolved, asset: &str, t: f64) -> Vec<O
     let len = media_clip_len(p, asset);
     let t = t.max(0.0);
     if track_free(p, r, &track, t, t + len, &[]) {
-        vec![Op::AddClip { clip: json!({"track": track, "asset": asset, "start": t}), overwrite: false }]
+        let (clip, then) = placed(p, asset, json!({"track": track, "start": t}));
+        let mut v = vec![Op::AddClip { clip, overwrite: false }];
+        v.extend(then);
+        v
     } else {
-        vec![Op::InsertClip { track, at: t, clip: json!({"asset": asset}), ripple: true }]
+        let (clip, then) = placed(p, asset, json!({}));
+        let mut v = vec![Op::InsertClip { track, at: t, clip, ripple: true }];
+        v.extend(then);
+        v
     }
 }
 
@@ -369,23 +404,35 @@ pub fn append_media_ops(p: &Project, asset: &str) -> Vec<Op> {
     let Some(m) = p.media.iter().find(|m| m.id == asset) else { return vec![] };
     let track = if m.kind == MediaKind::Audio { p.tracks.iter().find(|t| t.kind == TrackKind::Audio && !t.locked).map(|t| t.id.clone()) } else { main_track(p) };
     match track {
-        Some(track) => vec![Op::AppendClip { track, after: None, clip: json!({"asset": asset}) }],
+        Some(track) => {
+            let (clip, then) = placed(p, asset, json!({}));
+            let mut ops = vec![Op::AppendClip { track, after: None, clip }];
+            ops.extend(then);
+            ops
+        }
         None => drop_media_ops(p, asset, None, 0.0, false),
     }
 }
 
-/// Detaches a video clip's sound onto a free audio track (creating one when needed).
+/// Detaches a video clip's sound onto a free audio track (creating one when needed). A file with
+/// several sound streams gets one linked audio clip per stream not detached yet, each on its own
+/// track (`detach_streams`).
 pub fn detach_audio_ops(p: &Project, r: &Resolved, clip: &str) -> Vec<Op> {
     let Some(c) = p.clips.iter().find(|c| c.id == clip) else { return vec![] };
+    if let Source::Media { asset, .. } = &c.source {
+        if has_streams(p, asset) {
+            return vec![Op::DetachStreams { clip: clip.into(), streams: None, tracks: None, new_ids: None }];
+        }
+    }
     let span = util::span_or_fallback(p, r, c).0;
     let free = p.tracks.iter().find(|t| t.kind == TrackKind::Audio && !t.locked && track_free(p, r, &t.id, span.start, span.end, &[]));
     match free {
-        Some(t) => vec![Op::DetachAudio { clip: clip.into(), track: t.id.clone(), new_id: None }],
+        Some(t) => vec![Op::DetachAudio { clip: clip.into(), track: t.id.clone(), new_id: None, stream: None }],
         None => {
             let id = fresh_ids(p, "a", 1).remove(0);
             vec![
                 Op::AddTrack { id: Some(id.clone()), kind: TrackKind::Audio, name: None, role: None, index: None },
-                Op::DetachAudio { clip: clip.into(), track: id, new_id: None },
+                Op::DetachAudio { clip: clip.into(), track: id, new_id: None, stream: None },
             ]
         }
     }
@@ -725,7 +772,7 @@ pub(crate) mod tests {
     }
 
     pub fn media(id: &str, track: &str, asset: &str, start: f64, duration: f64, in_point: f64) -> Clip {
-        clip(id, track, Time::At(start), duration, Source::Media { asset: asset.into(), in_point })
+        clip(id, track, Time::At(start), duration, Source::Media { asset: asset.into(), in_point, stream: 0 })
     }
 
     pub fn text(id: &str, track: &str, start: Time, duration: f64) -> Clip {
@@ -889,6 +936,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn multi_stream_media_comes_in_with_one_linked_clip_per_stream() {
+        let mut p = demo();
+        let mut m = asset("mo", MediaKind::Video, 30.0);
+        m.info.audio_streams = ["Game", "Mic", "Discord"].iter().map(|t| aiframes_core::AudioStream { channels: 2, rate: 48_000, title: t.to_string(), ..Default::default() }).collect();
+        p.media.push(m);
+        let r = resolve(&p);
+        let streams_of = |q: &Project, asset: &str| -> Vec<(u32, String)> {
+            let mut v: Vec<(u32, String)> = q
+                .clips
+                .iter()
+                .filter_map(|c| match &c.source {
+                    Source::Media { asset: a, stream, .. } if a == asset && q.tracks.iter().any(|t| t.id == c.track && t.kind == TrackKind::Audio) => Some((*stream, c.track.clone())),
+                    _ => None,
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        // Every way of putting it on the timeline: drop (overwrite / insert / new track), add at playhead, append.
+        let cases: Vec<(&str, Vec<Op>)> = vec![
+            ("drop", drop_media_ops(&p, "mo", Some("v1"), 40.0, false)),
+            ("insert", drop_media_ops(&p, "mo", Some("v1"), 10.0, true)),
+            ("new track", drop_media_ops(&p, "mo", None, 0.0, false)),
+            ("add at playhead", add_media_at_ops(&p, &r, "mo", 40.0)),
+            ("append", append_media_ops(&p, "mo")),
+        ];
+        for (what, ops) in cases {
+            assert!(matches!(ops.last(), Some(Op::DetachStreams { .. })), "{what}: {ops:?}");
+            let (q, _) = run(&p, &ops);
+            let s = streams_of(&q, "mo");
+            assert_eq!(s.iter().map(|x| x.0).collect::<Vec<_>>(), vec![0, 1, 2], "{what}: {s:?}");
+            let tracks: std::collections::HashSet<&String> = s.iter().map(|x| &x.1).collect();
+            assert_eq!(tracks.len(), 3, "{what}: each stream on its own track");
+            let pic = q.clips.iter().find(|c| matches!(&c.source, Source::Media { asset, .. } if asset == "mo") && q.tracks.iter().any(|t| t.id == c.track && t.kind == TrackKind::Video)).unwrap();
+            assert!(pic.muted, "{what}: the picture's own sound is muted");
+            assert_eq!(aiframes_core::linked_partners(&q, &pic.id).len(), 3, "{what}: linked");
+        }
+        // Single-stream media is placed as before.
+        assert!(!drop_media_ops(&p, "mv", Some("v1"), 40.0, false).iter().any(|o| matches!(o, Op::DetachStreams { .. })));
+        // An existing clip of it (an older project): Detach audio gives every stream its own clip.
+        let mut q = p.clone();
+        q.clips.push(clip("old", "v1", Time::At(60.0), 5.0, Source::Media { asset: "mo".into(), in_point: 0.0, stream: 0 }));
+        let rq = resolve(&q);
+        let (q2, _) = run(&q, &detach_audio_ops(&q, &rq, "old"));
+        assert_eq!(aiframes_core::linked_partners(&q2, "old").len(), 3);
+    }
+
+    #[test]
     fn transitions_and_captions() {
         let mut p = demo();
         let r = resolve(&p);
@@ -900,7 +995,7 @@ pub(crate) mod tests {
         let op = add_transition_op(&q, &rq, "c1", "whip").unwrap();
         assert!(matches!(op, Op::SetTransition { .. }));
         // Captions: create the captions track.
-        p.transcripts.insert("ma".into(), Transcript { language: "en".into(), words: (0..20).map(|i| Word { text: format!(" w{i}"), start: i as f64 * 0.5, end: i as f64 * 0.5 + 0.4, conf: 1.0 }).collect() });
+        p.transcripts.insert("ma".into(), Transcript { language: "en".into(), words: (0..20).map(|i| Word { text: format!(" w{i}"), start: i as f64 * 0.5, end: i as f64 * 0.5 + 0.4, conf: 1.0 }).collect(), ..Default::default() });
         let r = resolve(&p);
         let clips = transcript_clips(&p, &r, &[]);
         assert_eq!(clips, vec!["c3"]);
@@ -916,7 +1011,7 @@ pub(crate) mod tests {
 
     fn captioned() -> Project {
         let mut p = demo();
-        p.transcripts.insert("ma".into(), Transcript { language: "en".into(), words: (0..24).map(|i| Word { text: format!(" w{i}"), start: i as f64 * 0.8, end: i as f64 * 0.8 + 0.4, conf: 1.0 }).collect() });
+        p.transcripts.insert("ma".into(), Transcript { language: "en".into(), words: (0..24).map(|i| Word { text: format!(" w{i}"), start: i as f64 * 0.8, end: i as f64 * 0.8 + 0.4, conf: 1.0 }).collect(), ..Default::default() });
         let (mut q, _) = run(&p, &caption_ops(&p, &["c3".to_string()], None, Some(3)));
         let caps: Vec<Id> = q.clips.iter().filter(|c| c.tags.iter().any(|t| t == "caption")).map(|c| c.id.clone()).collect();
         assert!(caps.len() >= 4, "{caps:?}");

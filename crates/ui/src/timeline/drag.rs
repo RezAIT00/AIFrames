@@ -416,7 +416,7 @@ mod tests {
         // Roll between a 0.02 s clip at the end of its media and its neighbour.
         let mut q = demo();
         q.clips[0].duration = 0.02;
-        q.clips[0].source = Source::Media { asset: "mv".into(), in_point: 119.98 };
+        q.clips[0].source = Source::Media { asset: "mv".into(), in_point: 119.98, stream: 0 };
         let rq = resolve(&q);
         let (lo, hi) = roll_bounds(&q, &rq, "c1", "c2").unwrap();
         assert!(lo <= hi, "roll ({lo}, {hi})");
@@ -461,7 +461,7 @@ mod tests {
         for reverse in [false, true] {
             let mut p = demo();
             p.clips[0].reverse = reverse;
-            p.clips[0].source = Source::Media { asset: "mv".into(), in_point: 20.0 };
+            p.clips[0].source = Source::Media { asset: "mv".into(), in_point: 20.0, stream: 0 };
             let op = slip_op(&p, "c1", 1.0).unwrap();
             let (q, _) = run(&p, &[op]);
             let before = eval::source_time(&p.clips[0], 2.0).unwrap();

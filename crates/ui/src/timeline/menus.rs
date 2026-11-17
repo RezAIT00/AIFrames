@@ -125,8 +125,16 @@ fn clip_menu(tl: &mut Timeline, ui: &mut Ui, cx: &EditCtx, lay: &Layout, id: &st
     let kind = util::clip_kind(p, c);
     let media = matches!(c.source, Source::Media { .. });
     if kind == ClipKind::Video && util::has_sound(p, c) {
-        let detached = !aiframes_core::linked_partners(p, id).is_empty();
-        if item_enabled(ui, !detached, if detached { "Audio detached" } else { "Detach audio" }, "") {
+        let linked = aiframes_core::linked_clips(p, id);
+        let streams = util::stream_count(p, c);
+        let detached = if streams > 1 { linked.len() >= streams } else { !linked.is_empty() };
+        let label = match (detached, streams > 1) {
+            (true, _) => "Audio detached".to_string(),
+            (false, true) if linked.is_empty() => format!("Detach audio ({streams} streams)"),
+            (false, true) => "Detach the other audio streams".to_string(),
+            (false, false) => "Detach audio".to_string(),
+        };
+        if item_enabled(ui, !detached, &label, "") {
             apply(out, format!("Detach audio of {id}"), edits::detach_audio_ops(p, r, id));
         }
     }

@@ -209,6 +209,16 @@ pub fn op_use(op: &Op) -> OpUse {
             u.uses(track);
             u.retimes = true;
         }
+        Op::DetachStreams { clip, tracks, .. } => {
+            u.target(clip);
+            for t in tracks.iter().flatten() {
+                u.uses(t);
+            }
+            u.retimes = true;
+        }
+        Op::SetAudioStream { clip, .. } => {
+            u.target(clip);
+        }
         Op::ReplaceMedia { clip, asset, .. } => {
             u.target(clip);
             u.uses(asset);
