@@ -138,6 +138,8 @@ struct Job {
     draft: bool,
     /// The frame under the (paused) playhead, not pre-roll.
     for_want: bool,
+    /// The play run the job was claimed in (`Engine::run`).
+    run: u64,
     gen: u64,
     scale: f32,
     snap: Arc<Snapshot>,
@@ -153,6 +155,8 @@ struct State {
     clock_frame: i64,
     lo: i64,
     hi: i64,
+    /// The engine's current play run (`Engine::run`).
+    run: u64,
     /// Paused: the frame under the playhead (and whether a draft is acceptable first).
     want: Option<(i64, bool)>,
     /// When `want` last changed.
@@ -180,7 +184,7 @@ impl State {
 
     fn job(&self, index: i64, draft: bool) -> Job {
         let for_want = !self.playing && self.want.is_some_and(|(i, _)| i == index);
-        Job { index, draft, for_want, gen: self.gen, scale: self.scale, snap: self.snap.clone() }
+        Job { index, draft, for_want, run: self.run, gen: self.gen, scale: self.scale, snap: self.snap.clone() }
     }
 
     fn next_job(&mut self) -> Option<Job> {
@@ -402,6 +406,7 @@ impl Engine {
                 clock_frame: 0,
                 lo: 0,
                 hi: 0,
+                run: 0,
                 want: Some((0, false)),
                 want_since: Instant::now(),
                 latest: None,
@@ -689,6 +694,7 @@ impl Engine {
             st.lo = frame_index(lo_t, fps).max(0);
             st.hi = frame_index(hi_t - 0.5 / fps, fps).max(st.lo);
             st.want = None;
+            st.run = self.run;
             // Frames of another position (before a seek, or the end of a loop) would be shown in
             // place of this one's: keep only those this run will play first.
             let (c, step) = (st.clock_frame, st.step);
@@ -715,6 +721,7 @@ impl Engine {
         self.range = None;
         let snap = self.snapshot();
         let mut st = lock(&self.shared.st);
+        st.run = self.run;
         st.playing = false;
         st.lo = 0;
         st.hi = frame_index(snap.duration(), snap.fps()).max(0);
@@ -1133,10 +1140,13 @@ fn worker(sh: Arc<Shared>, renderer: Arc<Renderer>, ctx: egui::Context) {
                 if job.draft {
                     st.draft = Some((job.index, img));
                 } else {
-                    // While playing, a frame the playhead has passed (rendered for a position
-                    // left by a seek) would only be shown in the wrong place.
+                    // While playing, a frame of an earlier run that the playhead has passed (rendered
+                    // for a position left by a seek) would only be shown in the wrong place. Late
+                    // frames of this run are kept: on a machine that cannot keep up they are what
+                    // there is to show.
                     let d = (job.index - st.clock_frame) * st.step.signum();
-                    if !st.playing || (d >= -2 && d <= (LOOKAHEAD + 2) * st.step.abs()) {
+                    let stale = st.playing && job.run != st.run && !(d >= -2 && d <= (LOOKAHEAD + 2) * st.step.abs());
+                    if !stale {
                         st.frames.insert(job.index, img);
                     }
                     if st.draft.as_ref().is_some_and(|(d, _)| *d == job.index) {
