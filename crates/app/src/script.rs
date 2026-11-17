@@ -3,7 +3,7 @@
 //!
 //! One command per line (`#` comments), coordinates in points:
 //! `wait N` · `move X Y` · `click X Y [mods]` · `dblclick X Y` · `drag X1 Y1 X2 Y2 [mods]` · `press X Y` /
-//! `release X Y` (a drag held across other commands, e.g. a `shot` mid-drag) ·
+//! `release X Y` (a drag held across other commands, e.g. a `shot` mid-drag) · `rclick X Y` ·
 //! `key NAME [mods]` (mods: ctrl, shift, alt joined by `+`) · `text STRING` · `shot PATH` ·
 //! `drop X Y PATH` (a file dropped from Explorer at X,Y) · `hover X Y PATH` (dragged over, not
 //! dropped; `hover off` ends it) · `copy` / `cut` / `paste [TEXT]` (the clipboard events egui
@@ -117,6 +117,14 @@ impl Script {
                         frames.push_back(frame(vec![Event::PointerMoved(p)], m));
                     }
                     frames.push_back(frame(vec![button(b, false, m)], m));
+                    frames.push_back(Frame::default());
+                }
+                "rclick" => {
+                    let p = pos2(num(0), num(1));
+                    let b = |pressed| Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed, modifiers: Modifiers::NONE };
+                    frames.push_back(frame(vec![Event::PointerMoved(p)], Modifiers::NONE));
+                    frames.push_back(frame(vec![b(true)], Modifiers::NONE));
+                    frames.push_back(frame(vec![b(false)], Modifiers::NONE));
                     frames.push_back(Frame::default());
                 }
                 "press" | "release" => {
