@@ -182,6 +182,11 @@ impl Encoder { pub fn start(opts: &EncodeOptions) -> Result<Self, MediaError>; p
 ```
 Sequential frame access (playback, export) must be fast: keep an ffmpeg decode session streaming forward and only reseek on
 backward/large jumps; LRU frame cache bounded by bytes. Never block the UI thread: the UI calls these from worker threads.
+Each seek is a new ffmpeg process (~0.2 s on 4 cores before decoding the GOP), so playback avoids seeking on the beat:
+`FrameCaching::Ahead` decodes a frame in a session of its own (never one a sequential reader uses) and playback uses it to
+open the next clip's decoder before a cut. A session that is starting publishes its seek point, so concurrent requests for the
+next frames wait for it instead of starting their own. `HwAccel::Auto` decodes HEVC, VP9, AV1 and 4K 8-bit H.264 with
+D3D11VA (falling back to the CPU if that fails) and everything else on the CPU (measurements on `HwAccel`).
 
 ## Render API (aiframes-render)
 
@@ -199,7 +204,11 @@ pub fn export(doc_dir: &Path, p: &Project, pool: Arc<MediaPool>, s: &ExportSetti
 pub fn contact_sheet(r: &Renderer, doc_dir: &Path, p: &Project, res: &Resolved, times: &[f64], cols: u32, thumb_w: u32) -> Result<Image, RenderError>; // labelled
 pub fn encode_png(img: &Image) -> Vec<u8>;
 ```
-The same `frame` function serves preview (scaled), snapshots and export, so what you see is what you get.
+The same `frame` function serves preview (scaled), snapshots and export, so what you see is what you get. A frame that is one
+plain picture over the background (a single video clip without effects, not rotated: most frames of most edits) is drawn
+straight to RGBA8 (`canvas::raster_over_rgba8`), with the same bytes as the general f32 canvas path (tested). Drafts
+(scrubbing) decode at the same size as full frames, so the full frame after a scrub comes from the frame cache.
+`Renderer::media_starts` / `prefetch_clip` let playback open decoders ahead of cuts.
 
 ## Status and where the real APIs are
 
@@ -246,3 +255,11 @@ entry with its author; AI entries highlighted; undo), AI panel (prompt box that 
 MCP endpoint, streaming its progress; AI-changed clips flash in the timeline), export dialog (presets: YouTube 1080p, 4K, Shorts
 1080×1920, ProRes, GIF; loudness target; progress + cancel), project settings. Autosave. Keyboard shortcuts: Space, J/K/L,
 I/O, S or Ctrl+K split, Q/W ripple trim, Delete/Shift+Delete ripple delete, Ctrl+Z/Y, +/- zoom, arrows frame step, M marker.
+
+Playback engine (`app/src/playback`): render workers render ahead of the playhead; the sound (or, without a device, the wall
+clock) is the master clock, and the clock waits at the start of a play until its first frames are rendered. Every Play, seek
+while playing and loop wrap starts a new *run*: buffered frames of another position are dropped and the frame on screen never
+holds back the new run's frames. While scrubbing, drafts follow the pointer, the newest finished one is shown when the exact
+frame is not ready, and the full frame is rendered once the playhead rests. Auto preview quality lowers the render scale one
+step after 1.5 s of playback dropping more than 12% of its frames while no decoder had to seek (a seek is not a resolution
+problem), and raises it after 15 s without drops. `aiframes --bench-playback` measures all of this (`app/src/bench.rs`).
