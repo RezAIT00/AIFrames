@@ -103,6 +103,20 @@ pub struct ViewerCx<'a> {
     pub warnings: &'a [String],
     pub volume: f32,
     pub muted: bool,
+    /// Playback rate readout and Auto quality state (the dropped-frame indicator).
+    pub perf: PlaybackPerf,
+}
+
+/// What the viewer says about playback performance.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlaybackPerf {
+    /// Frames shown in the last second, and how many there should have been.
+    pub fps: f32,
+    pub target_fps: f32,
+    /// Frames dropped in the last second.
+    pub dropped_recent: u64,
+    /// Auto quality lowered the preview from this scale to keep playback smooth.
+    pub lowered_from: Option<f32>,
 }
 
 #[derive(Default)]
@@ -218,11 +232,24 @@ impl Viewer {
         ui.horizontal(|ui| {
             theme::panel_header(ui, "PROGRAM");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                egui::ComboBox::from_id_salt("viewer-quality").width(58.0).selected_text(self.quality.label()).show_ui(ui, |ui| {
+                let lowered = cx.perf.lowered_from.filter(|_| self.quality == Quality::Auto);
+                let label = match lowered {
+                    Some(_) => format!("Auto {:.0}%", cx.render_scale * 100.0),
+                    None => self.quality.label().to_string(),
+                };
+                let tip = match lowered {
+                    Some(from) => format!(
+                        "Preview resolution: rendering at {:.0}% (Auto lowered it from {:.0}% because playback was dropping frames; it goes back up after a smooth stretch). Pick Full or 1/2 to fix it.",
+                        cx.render_scale * 100.0,
+                        from * 100.0
+                    ),
+                    None => format!("Preview resolution (rendering at {:.0}%). Auto follows the viewer size and lowers it while playback drops frames.", cx.render_scale * 100.0),
+                };
+                egui::ComboBox::from_id_salt("viewer-quality").width(if lowered.is_some() { 74.0 } else { 58.0 }).selected_text(label).show_ui(ui, |ui| {
                     for q in Quality::ALL {
                         ui.selectable_value(&mut self.quality, q, q.label());
                     }
-                }).response.on_hover_text(format!("Preview resolution (rendering at {:.0}%)", cx.render_scale * 100.0));
+                }).response.on_hover_text(tip);
                 egui::ComboBox::from_id_salt("viewer-zoom").width(54.0).selected_text(self.zoom.label()).show_ui(ui, |ui| {
                     for z in Zoom::ALL {
                         if ui.selectable_value(&mut self.zoom, z, z.label()).clicked() {
@@ -322,6 +349,28 @@ impl Viewer {
                 if cx.warnings.len() > 12 {
                     ui.label(format!("… and {} more", cx.warnings.len() - 12));
                 }
+            });
+        }
+        if cx.playing && cx.perf.target_fps > 0.0 {
+            // Dropped-frame indicator (like Resolve's): green while every frame is shown, amber
+            // with the real rate while frames are being dropped.
+            let dropping = cx.perf.dropped_recent > 0;
+            let text = if dropping {
+                format!("{:.0} / {:.0} fps", cx.perf.fps.min(cx.perf.target_fps), cx.perf.target_fps)
+            } else {
+                format!("{:.0} fps", cx.perf.target_fps)
+            };
+            let galley = painter.layout_no_wrap(text, FontId::monospace(11.0), Color32::from_gray(225));
+            let at = pos2(img_rect.left().max(area.left()) + 8.0, img_rect.top().max(area.top()) + 8.0);
+            let bg = Rect::from_min_size(at, galley.size() + vec2(14.0, 0.0)).expand(3.0);
+            painter.rect_filled(bg, 3.0, Color32::from_black_alpha(150));
+            let dot = if dropping { pal.warn } else { Color32::from_rgb(80, 200, 120) };
+            painter.circle_filled(pos2(at.x + 4.0, at.y + galley.size().y / 2.0), 3.5, dot);
+            painter.galley(at + vec2(14.0, 0.0), galley, Color32::from_gray(225));
+            ui.interact(bg, ui.scope_id().with("perf-badge"), Sense::hover()).on_hover_text(if dropping {
+                "Frames are being dropped: this machine cannot render the preview in real time at this resolution. Auto quality lowers it; or pick 1/2 or 1/4 (top right)."
+            } else {
+                "Playback shows every frame."
             });
         }
         if cx.buffering {

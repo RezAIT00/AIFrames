@@ -31,6 +31,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Pictures shown during play: (frame, width) → (hash, thumbnail).
+type Shots = BTreeMap<(i64, usize), (u64, Vec<u8>)>;
+
 struct Opts {
     project: PathBuf,
     scale: f32,
@@ -50,6 +53,8 @@ struct Opts {
     trace: Option<PathBuf>,
     /// Priority class of the whole run (children included): other programs' load does not steal its CPU.
     priority: String,
+    /// Auto quality (the engine may lower the scale while frames drop).
+    auto: bool,
 }
 
 fn parse(args: &[String]) -> Result<Opts, String> {
@@ -71,6 +76,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         cache_mb: 512,
         trace: None,
         priority: "above".into(),
+        auto: false,
     };
     let mut it = args.iter();
     let num = |v: Option<&String>, name: &str| -> Result<f64, String> { v.and_then(|s| s.parse::<f64>().ok()).ok_or_else(|| format!("{name} needs a number")) };
@@ -90,6 +96,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--cache-mb" => o.cache_mb = num(it.next(), a)? as usize,
             "--tests" => o.tests = it.next().ok_or("--tests needs a list")?.split(',').map(|s| s.trim().to_string()).collect(),
             "--audio" => o.audio = true,
+            "--auto" => o.auto = true,
             "--no-verify" => o.verify = false,
             "--label" => o.label = it.next().cloned().unwrap_or_default(),
             "--json" => o.json = it.next().map(PathBuf::from),
@@ -135,7 +142,11 @@ pub fn run(args: &[String]) -> i32 {
     let renderer = Arc::new(Renderer::new(pool.clone()));
     let ctx = egui::Context::default();
     let mut engine = Engine::with_audio(ctx, renderer, o.workers, snap.clone(), o.audio);
-    engine.set_scale(o.scale);
+    if o.auto {
+        engine.set_quality(o.scale, true);
+    } else {
+        engine.set_scale(o.scale);
+    }
     if o.audio {
         engine.set_volume(0.0, true);
     }
@@ -147,11 +158,12 @@ pub fn run(args: &[String]) -> i32 {
         "cores": mask.map(|m| m.count_ones()).unwrap_or(0),
         "fps": snap.fps(),
         "priority": o.priority,
+        "auto": o.auto,
     });
     let mut b = Bench { e: &mut engine, snap: snap.clone(), hz: o.hz, job: &job, pool: pool.clone() };
     // Opening the project shows its first frame.
     b.settle(0.0, 5.0);
-    let mut shown_frames: BTreeMap<i64, (u64, Vec<u8>)> = BTreeMap::new();
+    let mut shown_frames: Shots = BTreeMap::new();
     for t in &o.tests {
         let r = match t.as_str() {
             "play" => b.play(o.from, o.secs, true, o.verify.then_some(&mut shown_frames), o.trace.as_deref()),
@@ -161,6 +173,8 @@ pub fn run(args: &[String]) -> i32 {
             "step" => b.step(o.from),
             "loop" => b.looping(o.from),
             "jumpback" => b.jumpback(o.from),
+            "profile" => profile(&snap, o.scale, o.from, &cache_dir.join("p"), &job),
+            "decode" => decode_paths(&snap, o.scale, &cache_dir.join("d"), &job),
             other => {
                 eprintln!("unknown test {other}");
                 continue;
@@ -171,7 +185,7 @@ pub fn run(args: &[String]) -> i32 {
     drop(b);
     drop(engine);
     if o.verify && !shown_frames.is_empty() {
-        out["play"]["glitches"] = verify(&snap, o.scale, &shown_frames, &cache_dir.join("b"));
+        out["play"]["glitches"] = verify(&snap, &shown_frames, &cache_dir.join("b"));
     }
     let _ = std::fs::remove_dir_all(&cache_dir);
     let line = out.to_string();
@@ -289,7 +303,7 @@ impl Bench<'_> {
 
     /// `settled`: paused at `from` until the frame and its pre-roll are ready, then Play (Space);
     /// otherwise Play right after the seek (a click on the ruler and Space at once, `play from`).
-    fn play(&mut self, from: f64, secs: f64, settled: bool, mut shots: Option<&mut BTreeMap<i64, (u64, Vec<u8>)>>, trace: Option<&std::path::Path>) -> Value {
+    fn play(&mut self, from: f64, secs: f64, settled: bool, mut shots: Option<&mut Shots>, trace: Option<&std::path::Path>) -> Value {
         let fps = self.fps();
         let dur = self.snap.duration();
         let from = from.min((dur - secs.min(dur) - 0.1).max(0.0));
@@ -351,7 +365,7 @@ impl Bench<'_> {
                         if !draft {
                             shown.insert(i);
                             if let (Some(s), Some(img)) = (shots.as_deref_mut(), e.shown_image()) {
-                                s.entry(i).or_insert_with(|| fingerprint(&img));
+                                s.entry((i, img.size[0])).or_insert_with(|| fingerprint(&img));
                             }
                         }
                     }
@@ -366,6 +380,7 @@ impl Bench<'_> {
         let cpu = self.job.cpu_seconds() - cpu0;
         let pool1 = self.pool.stats();
         let engine_dropped = self.e.stats.dropped;
+        let end_scale = self.e.stats.scale;
         self.e.pause();
         if let Some(p) = trace {
             let _ = std::fs::write(p, format!("wall,clock,clock_frame,shown,draft\n{}\n", rows.join("\n")));
@@ -390,6 +405,7 @@ impl Bench<'_> {
             "backwards": backwards,
             "draft_ticks": drafts,
             "engine_dropped": engine_dropped,
+            "end_scale": end_scale,
             "cpu_cores": r1(cpu / wall.max(1e-9)),
             "decoder_seeks": pool1.seeks - pool0.seeks,
             "frames_decoded": pool1.frames_decoded - pool0.frames_decoded,
@@ -638,16 +654,118 @@ impl Bench<'_> {
     }
 }
 
+/// Where the time of one rendered frame goes, one frame at a time on one thread: decoding (the
+/// first clip's media at the size the compositor asks for), compositing (decode cached), and the
+/// conversion to the viewer's image.
+fn profile(snap: &Snapshot, scale: f32, from: f64, cache: &std::path::Path, job: &cpu::Job) -> Value {
+    let pool = MediaPool::with_cache_dir(2048 << 20, cache);
+    let r = Renderer::new(pool.clone());
+    let fps = snap.fps();
+    let o = FrameOptions { scale, guides: false, draft: false };
+    let n = 60i64;
+    let f0 = frame_index(from, fps);
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+    // Warm-up: opens the decoder at `from` (the seek is not what is measured here).
+    let _ = r.frame(&snap.dir, &snap.project, &snap.resolved, frame_time(f0, fps), &o);
+    let cpu0 = job.cpu_seconds();
+    let t0 = Instant::now();
+    for k in 1..=n {
+        let _ = r.frame(&snap.dir, &snap.project, &snap.resolved, frame_time(f0 + k, fps), &o);
+    }
+    let first_pass = ms(t0) / n as f64;
+    let cpu1 = job.cpu_seconds();
+    // Second pass: decoded frames come from the cache (compositing only).
+    let t1 = Instant::now();
+    let mut last = None;
+    for k in 1..=n {
+        last = r.frame(&snap.dir, &snap.project, &snap.resolved, frame_time(f0 + k, fps), &o).ok();
+    }
+    let compose = ms(t1) / n as f64;
+    let cpu2 = job.cpu_seconds();
+    let t2 = Instant::now();
+    if let Some(img) = &last {
+        for _ in 0..10 {
+            let _ = crate::playback::to_color_image(img);
+        }
+    }
+    let convert = ms(t2) / 10.0;
+    let st = pool.stats();
+    json!({
+        "frames": n,
+        "render_ms": r1(first_pass),
+        "compose_ms": r1(compose),
+        "decode_ms": r1(first_pass - compose),
+        "to_color_image_ms": r1(convert),
+        "cpu_per_frame_ms": r1((cpu1 - cpu0) * 1000.0 / n as f64),
+        "cpu_compose_per_frame_ms": r1((cpu2 - cpu1) * 1000.0 / n as f64),
+        "size": last.map(|i| format!("{}x{}", i.width, i.height)),
+        "cache_hits": st.cache_hits,
+        "seeks": st.seeks,
+    })
+}
+
+/// Seeks and sequential frames through each decoding path (CPU, D3D11VA, CUDA): frames rendered
+/// at the preview scale with a fresh pool per path.
+fn decode_paths(snap: &Snapshot, scale: f32, cache: &std::path::Path, job: &cpu::Job) -> Value {
+    use aiframes_media::HwAccel;
+    let fps = snap.fps();
+    let dur = snap.duration();
+    let o = FrameOptions { scale, guides: false, draft: false };
+    let mut res = serde_json::Map::new();
+    for (name, hw) in [("cpu", HwAccel::Off), ("d3d11va", HwAccel::D3d11va), ("cuda", HwAccel::Cuda)] {
+        let pool = MediaPool::with_cache_dir(512 << 20, cache.join(name));
+        pool.set_hwaccel(hw);
+        let r = Renderer::new(pool.clone());
+        let mut seeks: Vec<f64> = Vec::new();
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut err: Option<String> = None;
+        for _ in 0..6 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let t = frame_time(frame_index((rng % 10_000) as f64 / 10_000.0 * (dur - 4.0).max(0.0), fps), fps);
+            let t0 = Instant::now();
+            if let Err(e) = r.frame(&snap.dir, &snap.project, &snap.resolved, t, &o) {
+                err = Some(e.to_string());
+            }
+            seeks.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let start = frame_index(1.0f64.min(dur), fps);
+        let _ = r.frame(&snap.dir, &snap.project, &snap.resolved, frame_time(start, fps), &o);
+        let cpu0 = job.cpu_seconds();
+        let t0 = Instant::now();
+        let n = 90;
+        for k in 1..=n {
+            let _ = r.frame(&snap.dir, &snap.project, &snap.resolved, frame_time(start + k, fps), &o);
+        }
+        let wall = t0.elapsed().as_secs_f64();
+        let cpu = job.cpu_seconds() - cpu0;
+        res.insert(
+            name.into(),
+            json!({
+                "seek_ms_median": r1(pct(&seeks, 0.5)),
+                "seek_ms_max": r1(pct(&seeks, 1.0)),
+                "seq_fps": r1(n as f64 / wall),
+                "seq_cpu_ms_per_frame": r1(cpu * 1000.0 / n as f64),
+                "error": err,
+            }),
+        );
+    }
+    Value::Object(res)
+}
+
 /// Renders every frame shown during play again with a fresh pool and renderer and compares.
-fn verify(snap: &Snapshot, scale: f32, shown: &BTreeMap<i64, (u64, Vec<u8>)>, cache: &std::path::Path) -> Value {
+fn verify(snap: &Snapshot, shown: &Shots, cache: &std::path::Path) -> Value {
     let pool = MediaPool::with_cache_dir(256 << 20, cache);
     let r = Renderer::new(pool);
     let fps = snap.fps();
-    let o = FrameOptions { scale, guides: false, draft: false };
     let mut exact = 0;
     let mut wrong: Vec<Value> = Vec::new();
     let mut black = 0;
-    for (i, (hash, thumb)) in shown {
+    for ((i, width), (hash, thumb)) in shown {
+        // The scale the frame was shown at (Auto quality may have lowered it).
+        let scale = *width as f32 / snap.project.settings.width.max(1) as f32;
+        let o = FrameOptions { scale, guides: false, draft: false };
         let Ok(img) = r.frame(&snap.dir, &snap.project, &snap.resolved, frame_time(*i, fps), &o) else { continue };
         let Some(ci) = crate::playback::to_color_image(&img) else { continue };
         let (h2, t2) = fingerprint(&ci);
