@@ -93,6 +93,16 @@ fn import_places_every_stream_and_the_ai_sees_them() {
     assert_eq!(r["created"].as_array().unwrap().len(), 1, "one linked clip; a free audio track was used: {r}");
     let e = fails(&b, "import_media", json!({"paths": [path_str(&video())], "place": "append", "streams": "some"}));
     assert!(e.contains("'streams'"), "{e}");
+
+    // Several multi-stream files in one import, mixed with single-stream ones.
+    let dir3 = scratch("streams-ai-3");
+    call(&b, "new_project", json!({"preset": "720p", "path": path_str(&dir3.join("u.aifr"))}));
+    let copy = dir3.join("obs-copy.mkv");
+    std::fs::copy(obs_video(), &copy).unwrap();
+    let r = call(&b, "import_media", json!({"paths": [path_str(&obs_video()), path_str(&video()), path_str(&copy), path_str(&talk())], "place": "append"}));
+    let ids: Vec<String> = r["imported"].as_array().unwrap().iter().map(|a| a["id"].as_str().unwrap().to_string()).collect();
+    let counts: Vec<usize> = ids.iter().map(|a| clips_of(&b, a).len()).collect();
+    assert_eq!(counts, vec![4, 1, 4, 1], "picture + 3 streams for each OBS file, one clip for the others: {r}");
 }
 
 #[test]
@@ -111,4 +121,55 @@ fn schema_and_ops_document_the_stream_fields() {
     assert!(find("import_media").contains("streams"));
     assert!(find("transcribe").contains("stream"));
     assert!(find("detect_silence").contains("stream"));
+}
+
+/// Two sound streams: 0 a constant music bed (never quiet), 1 eight "words" (220 Hz) at 0.5 + 0.6·k,
+/// 0.45 s long with 0.15 s pauses — a voice recorded on its own track next to the game sound.
+fn two_stream_words() -> std::path::PathBuf {
+    let out = root().join("media").join("words-2-streams.mka");
+    if !out.exists() {
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        let tmp = out.with_file_name(format!("words-2-streams-{}.mka", std::process::id()));
+        ffmpeg(&[
+            "-f", "lavfi", "-i", "aevalsrc='0.3*sin(2*PI*330*t)':s=48000:d=6",
+            "-f", "lavfi", "-i", "aevalsrc='0.4*sin(2*PI*220*t)*gte(t,0.5)*lt(t,5.3)*lt(mod(t-0.5,0.6),0.45)':s=48000:d=6",
+            "-map", "0:a", "-map", "1:a", "-c:a", "flac", "-metadata:s:a:0", "title=Music", "-metadata:s:a:1", "title=Voice", "-f", "matroska",
+            tmp.to_str().unwrap(),
+        ]);
+        if std::fs::rename(&tmp, &out).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    out
+}
+
+#[test]
+fn word_cuts_are_measured_on_the_stream_the_words_came_from() {
+    let words: Vec<J> = (0..8)
+        .map(|k| {
+            let start = 0.5 + 0.6 * k as f64 + 0.06;
+            json!({"text": format!(" w{k}"), "start": start, "end": start + 0.6})
+        })
+        .collect();
+    let edges = |stream: u32| -> J {
+        let b = AiframesBackend::new(services());
+        call(&b, "new_project", json!({"name": "two streams"}));
+        let r = call(&b, "import_media", json!({"paths": [path_str(&two_stream_words())], "place": "none"}));
+        let asset = r["imported"][0]["id"].as_str().unwrap().to_string();
+        call(&b, "edit", json!({"ops": [
+            {"op": "add_clip", "clip": {"id": "vo", "track": "a1", "start": 0, "source": {"type": "media", "asset": asset, "stream": 1}}},
+            {"op": "set_transcript", "asset": asset, "transcript": {"language": "en", "words": words, "stream": stream}},
+        ]}));
+        call(&b, "delete_words", json!({"clip": "vo", "from": 2, "to": 2}))
+    };
+    // Heard on the voice stream: both edges land in the real pauses.
+    let r = edges(1);
+    let e = &r["cut_edges"][0];
+    assert_eq!((e["start"]["class"].as_str(), e["end"]["class"].as_str()), (Some("silence"), Some("silence")), "{r}");
+    let (s, t) = (e["start"]["t"].as_f64().unwrap(), e["end"]["t"].as_f64().unwrap());
+    assert!(s > 1.55 && s < 1.7 && t > 2.15 && t < 2.3, "edges in the pauses around word 2: {e}");
+    // Measured on the music stream (never quiet), the same cut finds no pause.
+    let r = edges(0);
+    let e = &r["cut_edges"][0];
+    assert!(e["start"]["class"] != "silence" || e["end"]["class"] != "silence", "the music stream has no pauses: {r}");
 }

@@ -376,7 +376,8 @@ impl Inspector {
 
     pub(crate) fn clip_panel(&mut self, ui: &mut Ui, cx: &EditCtx, c: &Clip, out: &mut Vec<UiAction>) {
         let p = cx.project;
-        let kind = util::clip_kind(p, c);
+        // A video file's sound on an audio track (a detached stream) is an audio clip here.
+        let kind = util::clip_kind_on_track(p, c);
         let local = Local::of(cx, c);
         let fps = util::fps(p);
         let mut ops: Vec<(String, Op)> = Vec::new();

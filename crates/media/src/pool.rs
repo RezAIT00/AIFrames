@@ -89,6 +89,8 @@ pub struct PoolStats {
 
 /// Decoded audio by (file, rate, sound stream), with a last-use tick.
 type AudioMap = HashMap<(u64, u32, u32), (Arc<AudioData>, u64)>;
+/// Waveforms by (file, sound stream), with a last-use tick.
+type WaveMap = HashMap<(u64, u32), (Arc<Waveform>, u64)>;
 
 /// Sessions kept per (file, output size) pair.
 const MAX_PER_KEY: usize = 3;
@@ -206,7 +208,7 @@ pub struct MediaPool {
     probe_inflight: Inflight<u64, Arc<Probed>>,
     audio: Mutex<AudioMap>,
     audio_inflight: Inflight<(u64, u32, u32), Arc<AudioData>>,
-    waves: Mutex<HashMap<(u64, u32), (Arc<Waveform>, u64)>>,
+    waves: Mutex<WaveMap>,
     wave_inflight: Inflight<(u64, u32), Arc<Waveform>>,
     image_inflight: Inflight<(u64, u32, u32), Frame>,
     thumb_inflight: Inflight<(u64, u32, i64), Frame>,

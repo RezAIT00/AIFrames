@@ -315,6 +315,7 @@ pub fn append_ops_with(p: &Project, assets: &[ImportedAsset], track: Option<&str
         ids.claim(&a.id).map_err(|e| e.message)?;
     }
     let mut ops = Vec::new();
+    let mut later = Vec::new();
     let mut clips = Vec::new();
     let given = match track {
         Some(t) => Some(p.tracks.iter().find(|x| x.id == t).ok_or_else(|| format!("unknown track '{t}'"))?),
@@ -340,11 +341,14 @@ pub fn append_ops_with(p: &Project, assets: &[ImportedAsset], track: Option<&str
         ops.push(op(json!({"op": "append_clip", "track": t, "clip": {"id": cid, "asset": a.id}}))?);
         if a.kind != MediaKind::Image {
             if let Some(o) = streams.op_for(&cid, &a.info)? {
-                ops.push(o);
+                later.push(o);
             }
         }
         clips.push(cid);
     }
+    // Last: the clips and tracks `detach_streams` adds take fresh ids, which must not be the ids
+    // handed out above.
+    ops.extend(later);
     Ok((ops, clips))
 }
 
