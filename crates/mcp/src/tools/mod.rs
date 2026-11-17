@@ -298,6 +298,7 @@ fn dispatch(s: &Arc<Services>, name: &str, args: &J) -> ToolResult {
         "seek" => view::seek(s, args),
         "select" => view::select(s, args),
         "show_panel" => view::show_panel(s, args),
+        "source_monitor" => view::source_monitor(s, args),
         "screenshot_ui" => view::screenshot_ui(s),
         "launch_gui" => Err("launch_gui is only available when AIFrames' MCP server runs over stdio (`aiframes mcp`). The AIFrames window is already running.".into()),
         other => {

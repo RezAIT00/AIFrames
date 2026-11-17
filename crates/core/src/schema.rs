@@ -633,6 +633,13 @@ pub fn schema_docs() -> Value {
                 {"form": "{\"bezier\": [x1, y1, x2, y2]}", "meaning": "CSS cubic-bezier.", "example": {"bezier": [0.25, 0.1, 0.25, 1.0]}},
             ],
         },
+        "source_edit": {
+            "about": "Three-point editing from the Source monitor (Premiere's Insert `,` and Overwrite `.`): a range of a media file (in_point .. in_point + duration, seconds of the file) goes into the timeline at a time. Both are ordinary ops; the source_monitor tool builds them exactly as the window does (default track: the main video track for pictures, the first audio track for sound; no marks = the whole file).",
+            "forms": [
+                {"form": "insert", "meaning": "insert_clip at `at`: a clip under `at` is split and later clips on that track move right by the new clip's length.", "example": {"op": "insert_clip", "track": "v1", "at": 12.0, "clip": {"asset": "m3", "in_point": 4.5, "duration": 2.0}}},
+                {"form": "overwrite", "meaning": "add_clip with overwrite: whatever is under the new clip on its track is trimmed or removed; nothing moves.", "example": {"op": "add_clip", "clip": {"track": "v1", "asset": "m3", "start": 12.0, "in_point": 4.5, "duration": 2.0}, "overwrite": true}},
+            ],
+        },
         "color": {
             "about": "sRGB colour, straight alpha. Written as \"#RRGGBB\" or \"#RRGGBBAA\".",
             "forms": [
@@ -790,6 +797,9 @@ mod tests {
         }
         for f in d["forms"]["color"]["forms"].as_array().unwrap() {
             check::<Color>(&f["example"], "color form");
+        }
+        for f in d["forms"]["source_edit"]["forms"].as_array().unwrap() {
+            crate::Op::from_json(&f["example"]).unwrap_or_else(|e| panic!("source_edit form {}: {e}", f["form"]));
         }
         fn variants<T: DeserializeOwned>(d: &Value, name: &str) {
             let vals: BTreeSet<String> = d["enums"][name].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();

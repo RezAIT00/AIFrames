@@ -600,7 +600,7 @@ impl Viewer {
     }
 }
 
-fn trim_fps(fps: f64) -> String {
+pub(crate) fn trim_fps(fps: f64) -> String {
     if (fps - fps.round()).abs() < 1e-6 {
         format!("{}", fps.round() as i64)
     } else {

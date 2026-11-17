@@ -794,6 +794,128 @@ pub fn beat_marker_ops(times: &[f64], every: usize) -> Result<Vec<Op>, String> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------------------------
+// Source monitor: three-point edits (insert / overwrite)
+// ---------------------------------------------------------------------------------------------
+
+/// How a Source-monitor range goes into the timeline (Premiere's Insert `,` and Overwrite `.`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceEdit {
+    /// Splits a clip under the time and moves later clips on that track right.
+    Insert,
+    /// Replaces whatever is under the new clip on its track; nothing moves.
+    Overwrite,
+}
+
+impl SourceEdit {
+    pub fn parse(s: &str) -> Option<SourceEdit> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "insert" => Some(SourceEdit::Insert),
+            "overwrite" => Some(SourceEdit::Overwrite),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            SourceEdit::Insert => "Insert",
+            SourceEdit::Overwrite => "Overwrite",
+        }
+    }
+}
+
+/// The source range `[in, out)` (seconds of the file) a source edit uses: the marks, else the
+/// whole file. Stills have no range (`None`: the clip gets the default still length unless both
+/// marks give one). Errors when the range is empty.
+pub fn source_range(m: &MediaAsset, in_point: Option<f64>, out_point: Option<f64>) -> Result<Option<(f64, f64)>, String> {
+    let fin = |v: Option<f64>, what: &str| -> Result<Option<f64>, String> {
+        match v {
+            Some(x) if !x.is_finite() => Err(format!("{what} must be a number of seconds")),
+            other => Ok(other),
+        }
+    };
+    let (a, b) = (fin(in_point, "in")?, fin(out_point, "out")?);
+    if m.kind == MediaKind::Image {
+        return match (a, b) {
+            (Some(a), Some(b)) if b - a > 1e-3 => Ok(Some((0.0, b - a))),
+            (Some(_), Some(_)) => Err("the out mark must be after the in mark".into()),
+            _ => Ok(None),
+        };
+    }
+    let dur = m.info.duration;
+    let end = if dur > 0.0 { dur } else { f64::INFINITY };
+    let a = a.unwrap_or(0.0).clamp(0.0, if end.is_finite() { end } else { f64::MAX });
+    let b = match b {
+        Some(b) => b.min(end),
+        None if end.is_finite() => end,
+        None => return Err(format!("{} has no known duration: set an out mark", m.id)),
+    };
+    if b - a < 1e-3 {
+        return Err(format!("the source range {a:.3}–{b:.3} s of {} is empty: the out mark must be after the in mark", m.id));
+    }
+    Ok(Some((a, b)))
+}
+
+/// Ops for a Source-monitor edit: `asset` from source second `in_point` to `out_point` (default:
+/// the whole file) placed at timeline second `at` on `track` (default: the main video track for
+/// pictures, the first unlocked audio track for sound; created when missing). One undoable step for
+/// the person and the AI alike: `insert_clip` (ripple) or `add_clip` with `overwrite`.
+pub fn source_edit_ops(p: &Project, asset: &str, in_point: Option<f64>, out_point: Option<f64>, at: f64, track: Option<&str>, mode: SourceEdit) -> Result<Vec<Op>, String> {
+    let m = p.media.iter().find(|m| m.id == asset).ok_or_else(|| format!("unknown media asset '{asset}'"))?;
+    if !at.is_finite() {
+        return Err("the timeline time must be a number of seconds".into());
+    }
+    let at = at.max(0.0);
+    let range = source_range(m, in_point, out_point)?;
+    let picture = m.kind != MediaKind::Audio;
+    let want = if picture { TrackKind::Video } else { TrackKind::Audio };
+    let mut ops = Vec::new();
+    let track = match track {
+        Some(t) => {
+            let tr = p.tracks.iter().find(|x| x.id == t).ok_or_else(|| format!("unknown track '{t}'"))?;
+            if tr.locked {
+                return Err(format!("track {t} is locked: unlock it or pick another track"));
+            }
+            if tr.kind != want {
+                let (what, need) = if picture { ("picture", "a video track") } else { ("sound-only", "an audio track") };
+                return Err(format!("{} is {what} media: put it on {need} (track {t} is not one)", m.id));
+            }
+            t.to_string()
+        }
+        None => {
+            let found = if picture {
+                main_video_track(p).filter(|id| p.tracks.iter().any(|t| &t.id == id && !t.locked)).or_else(|| p.tracks.iter().find(|t| t.kind == TrackKind::Video && !t.locked).map(|t| t.id.clone()))
+            } else {
+                p.tracks.iter().find(|t| t.kind == TrackKind::Audio && !t.locked).map(|t| t.id.clone())
+            };
+            match found {
+                Some(t) => t,
+                None => {
+                    let id = IdGen::new(p).fresh(if picture { "v" } else { "a" });
+                    let (kind, role, name) = if picture { ("video", "main", "Main") } else { ("audio", "voice", "Audio") };
+                    ops.push(op(json!({"op": "add_track", "id": id, "kind": kind, "role": role, "name": name}))?);
+                    id
+                }
+            }
+        }
+    };
+    let mut clip = json!({"asset": asset});
+    if let Some((a, b)) = range {
+        if m.kind != MediaKind::Image {
+            clip["in_point"] = json!(a);
+        }
+        clip["duration"] = json!(b - a);
+    }
+    match mode {
+        SourceEdit::Insert => ops.push(op(json!({"op": "insert_clip", "track": track, "at": at, "clip": clip}))?),
+        SourceEdit::Overwrite => {
+            clip["track"] = json!(track);
+            clip["start"] = json!(at);
+            ops.push(op(json!({"op": "add_clip", "clip": clip, "overwrite": true}))?);
+        }
+    }
+    Ok(ops)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -870,5 +992,67 @@ mod tests {
         assert!(matches!(&ops[0], Op::AddDucking { target, trigger, amount_db: Some(a), .. } if target == "a2" && trigger == "a1" && *a == -18.0));
         let ops = beat_marker_ops(&[0.5, 1.0, 1.5, 2.0, 2.5], 2).unwrap();
         assert_eq!(ops.len(), 3);
+    }
+
+    #[test]
+    fn source_edits_insert_and_overwrite() {
+        let mut p: Project = serde_json::from_value(json!({
+            "format": 1,
+            "settings": {"width": 1920, "height": 1080, "fps": 30.0},
+            "tracks": [{"id": "v1", "kind": "video", "role": "main"}, {"id": "a1", "kind": "audio"}],
+            "media": [
+                {"id": "mv", "path": "a.mp4", "kind": "video", "info": {"duration": 20.0, "width": 1920, "height": 1080, "fps": 30.0, "has_video": true, "has_audio": true}},
+                {"id": "ms", "path": "s.png", "kind": "image", "info": {"width": 800, "height": 600}},
+                {"id": "ma", "path": "a.wav", "kind": "audio", "info": {"duration": 9.0, "has_audio": true}}
+            ],
+            "clips": [
+                {"id": "c1", "track": "v1", "start": 0.0, "duration": 4.0, "source": {"type": "media", "asset": "mv", "in_point": 0.0}},
+                {"id": "c2", "track": "v1", "start": {"after": "c1"}, "duration": 4.0, "source": {"type": "media", "asset": "mv", "in_point": 10.0}}
+            ]
+        }))
+        .unwrap();
+        // Insert 2 s (source 5..7) at 2.0: c1 splits, everything after moves right by 2 s.
+        let ops = source_edit_ops(&p, "mv", Some(5.0), Some(7.0), 2.0, None, SourceEdit::Insert).unwrap();
+        let mut q = p.clone();
+        aiframes_core::apply_batch(&mut q, &ops).unwrap();
+        let r = resolve(&q);
+        assert!((r.duration - 10.0).abs() < 1e-6, "{}", r.duration);
+        let new = q.clips.iter().find(|c| matches!(&c.source, Source::Media { in_point, .. } if (*in_point - 5.0).abs() < 1e-9)).expect("the inserted clip");
+        let sp = r.span(&new.id).unwrap();
+        assert!((sp.start - 2.0).abs() < 1e-6 && (sp.end - 4.0).abs() < 1e-6, "{sp:?}");
+        assert!((r.span("c2").unwrap().start - 6.0).abs() < 1e-6, "later clips moved right");
+        // Overwrite the same range at 2.0: nothing moves, the length stays 8 s.
+        let ops = source_edit_ops(&p, "mv", Some(5.0), Some(7.0), 2.0, None, SourceEdit::Overwrite).unwrap();
+        let mut q = p.clone();
+        aiframes_core::apply_batch(&mut q, &ops).unwrap();
+        let r = resolve(&q);
+        assert!((r.duration - 8.0).abs() < 1e-6, "{}", r.duration);
+        assert!((r.span("c2").unwrap().start - 4.0).abs() < 1e-6);
+        // No marks: the whole file; sound-only media goes to an audio track.
+        let ops = source_edit_ops(&p, "ma", None, None, 1.0, None, SourceEdit::Overwrite).unwrap();
+        let mut q = p.clone();
+        aiframes_core::apply_batch(&mut q, &ops).unwrap();
+        let c = q.clips.last().unwrap();
+        assert_eq!(c.track, "a1");
+        assert!((c.duration - 9.0).abs() < 1e-9);
+        // Stills: no range unless both marks; never an in_point.
+        let ops = source_edit_ops(&p, "ms", None, None, 8.0, None, SourceEdit::Insert).unwrap();
+        aiframes_core::apply_batch(&mut p.clone(), &ops).unwrap();
+        let ops = source_edit_ops(&p, "ms", Some(1.0), Some(3.5), 8.0, None, SourceEdit::Overwrite).unwrap();
+        let mut q = p.clone();
+        aiframes_core::apply_batch(&mut q, &ops).unwrap();
+        assert!((q.clips.last().unwrap().duration - 2.5).abs() < 1e-9);
+        // Loud failures.
+        assert!(source_edit_ops(&p, "mv", Some(7.0), Some(5.0), 0.0, None, SourceEdit::Insert).unwrap_err().contains("after the in mark"));
+        assert!(source_edit_ops(&p, "zz", None, None, 0.0, None, SourceEdit::Insert).unwrap_err().contains("unknown media"));
+        assert!(source_edit_ops(&p, "ma", None, None, 0.0, Some("v1"), SourceEdit::Insert).unwrap_err().contains("audio track"));
+        p.tracks[0].locked = true;
+        assert!(source_edit_ops(&p, "mv", None, None, 0.0, Some("v1"), SourceEdit::Insert).unwrap_err().contains("locked"));
+        // The main track is locked: the edit goes to a new video track.
+        let ops = source_edit_ops(&p, "mv", None, Some(3.0), 0.0, None, SourceEdit::Overwrite).unwrap();
+        assert!(matches!(&ops[0], Op::AddTrack { kind: TrackKind::Video, .. }), "{ops:?}");
+        aiframes_core::apply_batch(&mut p, &ops).unwrap();
+        assert_eq!(SourceEdit::parse(" Overwrite "), Some(SourceEdit::Overwrite));
+        assert_eq!(SourceEdit::parse("lift"), None);
     }
 }

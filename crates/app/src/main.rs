@@ -22,6 +22,7 @@ mod register;
 mod script;
 mod selftest;
 mod shortcuts;
+mod source;
 mod sysmem;
 mod theme;
 mod timecode;

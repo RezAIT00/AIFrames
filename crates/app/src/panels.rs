@@ -53,6 +53,8 @@ pub enum PanelId {
     Bin,
     Side,
     Timeline,
+    /// (added)
+    Source,
 }
 
 /// Everything the app can be asked to do from menus, tabs and the status bar.
@@ -111,6 +113,8 @@ pub struct MenuInfo<'a> {
     pub show_bin: bool,
     pub show_side: bool,
     pub show_timeline: bool,
+    /// (added)
+    pub show_source: bool,
     pub safe: bool,
     pub zoom: Zoom,
     pub quality: Quality,
@@ -242,6 +246,7 @@ pub fn menu_bar(ui: &mut egui::Ui, m: &MenuInfo) -> Vec<Cmd> {
             check(ui, &mut out, "Media Bin", m.show_bin, "", Cmd::TogglePanel(PanelId::Bin));
             check(ui, &mut out, "Inspector Panels", m.show_side, "", Cmd::TogglePanel(PanelId::Side));
             check(ui, &mut out, "Timeline", m.show_timeline, "", Cmd::TogglePanel(PanelId::Timeline));
+            check(ui, &mut out, "Source Monitor", m.show_source, "", Cmd::TogglePanel(PanelId::Source));
             ui.menu_button(gutter("Panel", false), |ui| {
                 for t in SideTab::ALL {
                     item(ui, &mut out, t.label(), "", true, Cmd::Side(t));

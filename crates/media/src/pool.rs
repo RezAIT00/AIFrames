@@ -227,6 +227,8 @@ pub struct MediaPool {
     readahead_budget: AtomicUsize,
     /// Recent request times per stream (sequential-access detection): (source t, wall ms).
     recent: Mutex<HashMap<StreamKey, Vec<(f64, u64)>>>,
+    /// Thumbnail decoders start at below-normal priority (while playback needs the CPU).
+    thumbs_background: AtomicBool,
 }
 
 fn hw_to_u8(h: HwAccel) -> u8 {
@@ -282,7 +284,15 @@ impl MediaPool {
             session_mem: Arc::new(AtomicUsize::new(0)),
             readahead_budget: AtomicUsize::new(DEFAULT_READAHEAD_BYTES),
             recent: Mutex::new(HashMap::new()),
+            thumbs_background: AtomicBool::new(false),
         })
+    }
+
+    /// Thumbnail decoders at below-normal priority (`true` while the viewer plays, so playback keeps
+    /// the CPU) or at normal priority (paused: what the person is looking at loads first, also on a
+    /// busy machine where below-normal work can wait for minutes).
+    pub fn set_thumbnails_background(&self, background: bool) {
+        self.thumbs_background.store(background, Ordering::Relaxed);
     }
 
     /// The on-disk cache folder.
@@ -819,7 +829,8 @@ impl MediaPool {
 
     /// A small picture of the file at `t` for timeline filmstrips, `height` pixels tall (width
     /// from the aspect ratio). `t` is snapped to a 0.1 s grid; results are cached in memory and on
-    /// disk, and at most four thumbnails decode at once. Stills return the scaled image.
+    /// disk, and at most four thumbnails decode at once. Stills return the scaled image. Decoders
+    /// run at normal priority unless [`MediaPool::set_thumbnails_background`] is on.
     pub fn thumbnail(&self, path: &Path, t: f64, height: u32) -> Result<Frame> {
         let (fk, p) = self.lookup(path)?;
         let height = height.clamp(8, 2160);
@@ -861,7 +872,7 @@ impl MediaPool {
             spec.readahead = 1;
             spec.threads = Some(4);
             spec.hw = HwAccel::Off;
-            spec.background = true;
+            spec.background = self.thumbs_background.load(Ordering::Relaxed);
             spec.lean = true;
             let first = Session::start(Arc::new(spec.clone()), tq)?.first()?;
             let rgba = match first {
@@ -1104,8 +1115,17 @@ impl MediaPool {
     /// Deletes the oldest on-disk cache files until the cache folder is under `max_bytes`.
     /// Files in use by another process are skipped. Returns the bytes freed.
     pub fn prune_disk_cache(&self, max_bytes: u64) -> u64 {
+        self.prune_cache_dirs(&["audio", "waveform", "thumbs"], max_bytes)
+    }
+
+    /// Like [`MediaPool::prune_disk_cache`] for the thumbnail cache only (the app keeps it bounded).
+    pub fn prune_thumbnail_cache(&self, max_bytes: u64) -> u64 {
+        self.prune_cache_dirs(&["thumbs"], max_bytes)
+    }
+
+    fn prune_cache_dirs(&self, subs: &[&str], max_bytes: u64) -> u64 {
         let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
-        for sub in ["audio", "waveform", "thumbs"] {
+        for sub in subs {
             if let Ok(rd) = std::fs::read_dir(self.cache_dir.join(sub)) {
                 for e in rd.flatten() {
                     if let Ok(m) = e.metadata() {

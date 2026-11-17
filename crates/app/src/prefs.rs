@@ -39,6 +39,10 @@ pub struct Layout {
     pub show_bin: bool,
     pub show_side: bool,
     pub show_timeline: bool,
+    /// (added) The Source monitor beside the program viewer.
+    pub show_source: bool,
+    /// (added) Its width (0 = half of the centre area).
+    pub source_width: f32,
     pub side_tab: String,
     pub safe_guides: bool,
     pub window: Option<[f32; 4]>,
@@ -54,6 +58,8 @@ impl Default for Layout {
             show_bin: true,
             show_side: true,
             show_timeline: true,
+            show_source: false,
+            source_width: 0.0,
             side_tab: "inspector".into(),
             safe_guides: false,
             window: None,

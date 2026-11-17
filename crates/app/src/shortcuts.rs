@@ -54,6 +54,10 @@ pub enum Command {
     Preferences,
     AiPanel,
     Shortcuts,
+    /// (added) Source monitor: insert its marked range at the timeline playhead (ripple).
+    InsertSource,
+    /// (added) Source monitor: overwrite its marked range at the timeline playhead.
+    OverwriteSource,
 }
 
 /// When a shortcut applies.
@@ -134,6 +138,8 @@ pub static SHORTCUTS: &[Shortcut] = &[
     sc(Key::P, true, true, false, C::ProjectSettings, G, "Project settings"),
     sc(Key::Space, true, false, false, C::AiPanel, G, "Ask the AI"),
     sc(Key::F1, false, false, false, C::Shortcuts, G, "Keyboard shortcuts"),
+    sc(Key::Comma, false, false, false, C::InsertSource, G, "Insert the Source monitor's in–out at the timeline playhead"),
+    sc(Key::Period, false, false, false, C::OverwriteSource, G, "Overwrite with the Source monitor's in–out at the timeline playhead"),
 ];
 
 /// Keys only the timeline handles (while it is the active panel), for the shortcuts window. The
@@ -227,6 +233,7 @@ fn key_name(k: Key) -> &'static str {
         Key::Backslash => "\\",
         Key::Quote => "'",
         Key::Comma => ",",
+        Key::Period => ".",
         Key::F1 => "F1",
         other => other.name(),
     }

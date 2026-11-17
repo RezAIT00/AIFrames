@@ -86,6 +86,20 @@ pub struct LiveState {
     /// (Addition) The session of every AI edit by revision (the latest [`AI_SESSIONS_KEPT`]), so the
     /// window can group a session's edits into one recap.
     pub ai_sessions: std::collections::BTreeMap<u64, AiSession>,
+    /// (Addition) The person's Source monitor (written by the GUI every frame).
+    pub source: SourceView,
+    /// (Addition) A file the AI wants shown in the Source monitor, with marks (consumed by the GUI).
+    pub source_request: Option<SourceView>,
+}
+
+/// (Addition) What the Source monitor shows: a media file, its playhead and in/out marks, all in
+/// seconds of the file (source seconds, like `in_point`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SourceView {
+    pub asset: Option<Id>,
+    pub playhead: f64,
+    pub in_point: Option<f64>,
+    pub out_point: Option<f64>,
 }
 
 /// (Addition) How many revisions [`LiveState::ai_sessions`] remembers.

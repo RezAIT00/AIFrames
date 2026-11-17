@@ -1,6 +1,7 @@
-//! The media bin: grid (thumbnails with hover scrubbing, duration, kind, transcript and "on timeline"
-//! badges) or list view; search and kind filter; import; drag out as [`MediaDrag`]; double-click adds
-//! at the playhead; context menu (add, append, transcribe, rename, notes, reveal, relink, remove).
+//! The media bin: grid (poster frames at the tile's physical size, hover scrubbing, duration, kind,
+//! transcript and "on timeline" badges) or list view; search and kind filter; import; drag out as
+//! [`MediaDrag`]; double-click opens the file in the Source monitor; context menu (open, add, append,
+//! transcribe, rename, notes, reveal, relink, remove).
 
 use crate::style::{self, alpha, rgb};
 use crate::util;
@@ -74,44 +75,79 @@ pub(crate) fn filter_media<'a>(p: &'a Project, search: &str, kind: Option<MediaK
         .collect()
 }
 
-/// A thumbnail (or waveform for audio, or a placeholder) filling `rect`.
+/// Frames prefetched across a video when the pointer enters its bin tile (hover scrubbing).
+const SCRUB_STRIP: usize = 24;
+
+/// The hover-scrub moment for a pointer at `frac` (0..1) across a tile `px` physical pixels wide:
+/// quantized to the pixel (or the 0.1 s thumbnail grid if finer), so moving within one pixel asks
+/// for the same frame.
+pub(crate) fn scrub_time(frac: f64, duration: f64, px: f32) -> f64 {
+    if duration.is_nan() || duration <= 0.0 || !frac.is_finite() {
+        return 0.0;
+    }
+    let step = (duration / px.max(1.0) as f64).max(0.1);
+    let t = frac.clamp(0.0, 1.0) * duration;
+    ((t / step).floor() * step).clamp(0.0, (duration - 1e-3).max(0.0))
+}
+
+/// An audio file's waveform filling `rect` (dB scale, peaks and RMS, one column per physical pixel).
+pub(crate) fn paint_wave_tile(p: &egui::Painter, w: &aiframes_media::Waveform, duration: f64, rect: Rect, color: Color32) {
+    let dur = w.duration.max(duration).max(1e-3);
+    let ppp = p.ctx().pixels_per_point();
+    let r = rect.shrink2(vec2(0.0, rect.height() * 0.08));
+    let look = crate::timeline::wave::WaveLook { color, log: true, rectified: false, ppp };
+    crate::timeline::wave::paint(p, r, rect.left(), rect.right(), look, |a, b| {
+        let t0 = dur * ((a - rect.left()) / rect.width()) as f64;
+        let t1 = dur * ((b - rect.left()) / rect.width()) as f64;
+        let (mn, mx) = w.range(t0, t1);
+        Some(crate::timeline::wave::Column { min: mn, max: mx, rms: w.rms_range(t0, t1) })
+    });
+}
+
+/// The file's picture (or waveform for audio, or a placeholder) filling `rect`: its poster frame
+/// (`t` is kept for existing callers, which all ask for the representative frame).
 pub(crate) fn paint_thumb(painter: &egui::Painter, cx: &EditCtx, m: &MediaAsset, rect: Rect, t: f64) {
+    let _ = t;
+    paint_media(painter, cx, m, rect, None);
+}
+
+/// A thumbnail (or waveform for audio, or a placeholder) filling `rect`: the poster frame, or the
+/// frame at `t` (hover scrubbing). Decoded at the rect's physical size.
+pub(crate) fn paint_media(painter: &egui::Painter, cx: &EditCtx, m: &MediaAsset, rect: Rect, t: Option<f64>) {
     let p = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
     p.rect_filled(rect, CornerRadius::same(3), rgb(0x0F, 0x10, 0x12));
+    let px = rect.height() * p.ctx().pixels_per_point();
     match m.kind {
         MediaKind::Audio => {
             p.rect_filled(rect, CornerRadius::same(3), alpha(kind_color(m.kind), 0.35));
             if let Some(w) = cx.preview.waveform(m) {
-                let n = rect.width().max(1.0) as usize;
-                let dur = w.duration.max(m.info.duration).max(1e-3);
-                let mid = rect.center().y;
-                let half = rect.height() * 0.42;
-                let mut mesh = egui::epaint::Mesh::default();
-                for i in 0..n {
-                    let t0 = dur * i as f64 / n as f64;
-                    let t1 = dur * (i + 1) as f64 / n as f64;
-                    let (mn, mx) = w.range(t0, t1);
-                    let x = rect.left() + i as f32;
-                    mesh.add_colored_rect(Rect::from_min_max(pos2(x, mid - mx * half), pos2(x + 1.0, mid - mn * half + 0.5)), style::wave_color(util::ClipKind::Audio));
-                }
-                p.add(egui::Shape::mesh(mesh));
+                paint_wave_tile(&p, &w, m.info.duration, rect, style::wave_color(util::ClipKind::Audio));
             } else {
                 style::speaker_glyph(&p, rect.center(), alpha(Color32::WHITE, 0.5));
             }
         }
         _ => {
-            let t = if m.kind == MediaKind::Image { 0.0 } else { t.clamp(0.0, (m.info.duration - 1e-3).max(0.0)) };
-            match cx.preview.thumbnail(m, t) {
+            let tex = match t {
+                Some(t) if m.kind == MediaKind::Video => cx.preview.thumbnail_px(m, t.clamp(0.0, (m.info.duration - 1e-3).max(0.0)), px, f64::INFINITY),
+                _ => cx.preview.poster(m, px),
+            };
+            match tex {
                 Some(tex) => {
-                    // Fit the picture's aspect inside the rect.
+                    // Fit the picture's aspect inside the rect (info is the display size: rotation applied).
                     let aspect = if m.info.width > 0 && m.info.height > 0 { m.info.width as f32 / m.info.height as f32 } else { 16.0 / 9.0 };
-                    let mut r = rect;
-                    if rect.width() / rect.height() > aspect {
-                        r = Rect::from_center_size(rect.center(), vec2(rect.height() * aspect, rect.height()));
+                    let r = if rect.width() / rect.height() > aspect {
+                        Rect::from_center_size(rect.center(), vec2(rect.height() * aspect, rect.height()))
                     } else {
-                        r = Rect::from_center_size(r.center(), vec2(rect.width(), rect.width() / aspect));
-                    }
+                        Rect::from_center_size(rect.center(), vec2(rect.width(), rect.width() / aspect))
+                    };
                     p.image(tex, r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                }
+                None if cx.preview.failed(m) => {
+                    p.rect_filled(rect.shrink(1.0), CornerRadius::same(3), alpha(style::ERROR, 0.18));
+                    style::film_glyph(&p, rect.center() - vec2(0.0, 7.0), alpha(style::ERROR, 0.8));
+                    if rect.height() >= 40.0 {
+                        p.text(rect.center() + vec2(0.0, 6.0), Align2::CENTER_CENTER, "no preview", FontId::proportional(10.0), alpha(Color32::WHITE, 0.7));
+                    }
                 }
                 None => {
                     p.rect_filled(rect.shrink(1.0), CornerRadius::same(3), alpha(kind_color(m.kind), 0.25));
@@ -206,12 +242,20 @@ impl MediaBin {
             p.rect_filled(rect.expand(2.0), CornerRadius::same(5), if selected { alpha(style::ACCENT, 0.18) } else { alpha(Color32::WHITE, 0.04) });
         }
         let thumb = Rect::from_min_size(rect.min, vec2(w, thumb_h));
-        // Hover scrubbing.
-        let t = match resp.hover_pos() {
-            Some(pos) if m.kind == MediaKind::Video && thumb.contains(pos) => ((pos.x - thumb.left()) / thumb.width()) as f64 * m.info.duration,
-            _ => m.info.duration * 0.1,
+        // Hover scrubbing: the frame under the pointer (quantized to a pixel), with a strip across
+        // the file prefetched so moving around is instant.
+        let ppp = ui.ctx().pixels_per_point();
+        let scrub = match resp.hover_pos() {
+            Some(pos) if m.kind == MediaKind::Video && thumb.contains(pos) && m.info.duration > 0.0 => {
+                let px = thumb.height() * ppp;
+                let strip: Vec<f64> = (0..SCRUB_STRIP).map(|i| scrub_time((i as f64 + 0.5) / SCRUB_STRIP as f64, m.info.duration, thumb.width() * ppp)).collect();
+                cx.preview.prefetch(m, &strip, px);
+                Some(scrub_time(((pos.x - thumb.left()) / thumb.width()) as f64, m.info.duration, thumb.width() * ppp))
+            }
+            _ => None,
         };
-        paint_thumb(&ui.painter_at(thumb), cx, m, thumb, t);
+        let t = scrub.unwrap_or(0.0);
+        paint_media(&ui.painter_at(thumb), cx, m, thumb, scrub);
         if resp.hovered() && m.kind == MediaKind::Video {
             if let Some(pos) = resp.hover_pos().filter(|p| thumb.contains(*p)) {
                 p.vline(pos.x, thumb.y_range(), Stroke::new(1.0, alpha(style::PLAYHEAD, 0.8)));
@@ -259,7 +303,7 @@ impl MediaBin {
             p.rect_filled(rect, CornerRadius::same(3), alpha(Color32::WHITE, 0.04));
         }
         let thumb = Rect::from_min_size(rect.min + vec2(2.0, 2.0), vec2(42.0, 24.0));
-        paint_thumb(&ui.painter_at(thumb), cx, m, thumb, m.info.duration * 0.1);
+        paint_media(&ui.painter_at(thumb), cx, m, thumb, None);
         let strong = ui.visuals().strong_text_color();
         let weak = ui.visuals().weak_text_color();
         let x = thumb.right() + 8.0;
@@ -295,7 +339,7 @@ impl MediaBin {
                 // Above-left of the pointer: the timeline shows its drop info below-right.
                 let r = Rect::from_min_size(pos + vec2(-108.0, -76.0), vec2(96.0, 54.0));
                 painter.rect_filled(r.expand(2.0), CornerRadius::same(4), alpha(Color32::BLACK, 0.8));
-                paint_thumb(&painter, cx, m, r, m.info.duration * 0.1);
+                paint_media(&painter, cx, m, r, None);
                 painter.text(r.left_bottom() + vec2(0.0, 4.0), Align2::LEFT_TOP, util::media_name(m), FontId::proportional(10.5), Color32::WHITE);
             }
         }
@@ -310,14 +354,19 @@ impl MediaBin {
             out.push(UiAction::Select(sel));
         }
         if resp.double_clicked() {
-            out.push(UiAction::Apply { label: format!("Add {}", util::media_name(m)), ops: edits::add_media_at_ops(p, cx.resolved, &m.id, cx.playhead) });
+            // Like Premiere and Resolve: double-click opens the file in the Source monitor.
+            out.push(UiAction::OpenSource(m.id.clone()));
         }
         let notes = if m.notes.is_empty() { String::new() } else { format!("\n“{}”", util::ellipsize(&m.notes, 120)) };
         let tags = if m.tags.is_empty() { String::new() } else { format!("\ntags: {}", m.tags.join(", ")) };
-        let resp = resp.clone().on_hover_text(format!("{} ({})\n{}{notes}{tags}\nDrag to the timeline · double-click adds at the playhead", util::media_name(m), m.id, m.path));
+        let resp = resp.clone().on_hover_text(format!("{} ({})\n{}{notes}{tags}\nDouble-click opens it in the Source monitor · drag to the timeline", util::media_name(m), m.id, m.path));
         resp.context_menu(|ui| {
             ui.set_min_width(200.0);
             ui.label(RichText::new(util::media_name(m)).small().weak());
+            if ui.button("Open in Source monitor").clicked() {
+                out.push(UiAction::OpenSource(m.id.clone()));
+                ui.close();
+            }
             if ui.button("Add to timeline at playhead").clicked() {
                 out.push(UiAction::Apply { label: format!("Add {}", util::media_name(m)), ops: edits::add_media_at_ops(p, cx.resolved, &m.id, cx.playhead) });
                 ui.close();
@@ -424,6 +473,21 @@ fn trim(v: f64) -> String {
 mod tests {
     use super::*;
     use crate::edits::tests::*;
+
+    #[test]
+    fn hover_scrub_times() {
+        // 20 s across a 300 px tile: one moment per pixel (1/15 s, below the 0.1 s grid -> 0.1 s).
+        assert_eq!(scrub_time(0.0, 20.0, 300.0), 0.0);
+        assert!((scrub_time(0.5, 20.0, 300.0) - 10.0).abs() < 1e-9);
+        assert!(scrub_time(1.0, 20.0, 300.0) < 20.0, "never past the last frame");
+        // A 12-minute file: 2.4 s per pixel, and nearby pointer positions share a frame.
+        let a = scrub_time(0.5001, 720.0, 300.0);
+        let b = scrub_time(0.5002, 720.0, 300.0);
+        assert_eq!(a, b);
+        assert!((a % 2.4).abs() < 1e-6 || (2.4 - a % 2.4).abs() < 1e-6);
+        assert_eq!(scrub_time(0.5, 0.0, 300.0), 0.0, "no duration");
+        assert_eq!(scrub_time(f64::NAN, 10.0, 300.0), 0.0);
+    }
 
     #[test]
     fn search_filter_and_usage() {

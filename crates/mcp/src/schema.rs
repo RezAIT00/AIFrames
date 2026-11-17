@@ -526,6 +526,24 @@ pub fn definitions(include_launch: bool) -> Vec<J> {
         tool("pause", "Pause", "Stop playback in the window.", json!({}), &[], Write),
         tool("seek", "Seek", "Move the playhead (the person sees that frame).", json!({"time": time("Where."), "clip": s("Or: the start of this clip."), "marker": s("Or: this marker.")}), &[], Write),
         tool("select", "Select", "Select clips in the person's timeline to show what you mean.", json!({"clips": strs("Clip ids (empty = clear)."), "seek": b("Also move the playhead to the first clip.")}), &[], Write),
+        tool(
+            "source_monitor",
+            "Source monitor",
+            "The person's Source monitor (a media file with its own playhead and in/out marks, in seconds of the file). No arguments: what it shows. With asset/in/out/at: show that file there with those marks (null clears a mark). With edit: \"insert\" or \"overwrite\" the marked range (the arguments, else the person's marks, else the whole file) at the timeline playhead (or time) on track (default: main video track for pictures, first audio track for sound) — the same ops (insert_clip / add_clip with overwrite) as the window's , and . keys, one undoable step; accepts plan and label like edit.",
+            json!({
+                "asset": s("Media id (list_media)."),
+                "in": n("In mark, seconds of the file (null clears)."),
+                "out": n("Out mark, seconds of the file (null clears)."),
+                "at": n("Source playhead, seconds of the file."),
+                "edit": s("\"insert\" (ripple: later clips on the track move right) or \"overwrite\" (replaces what is there)."),
+                "time": time("Timeline time for the edit (default: the playhead)."),
+                "track": s("Track for the edit (default: main video track for pictures, first audio track for sound)."),
+                "plan": b("Dry run: the receipt without applying."),
+                "label": s("History label for the edit."),
+            }),
+            &[],
+            Edit,
+        ),
         tool("screenshot_ui", "Screenshot window", "PNG of the AIFrames window exactly as the person sees it (needs the window: live mode or after launch_gui).", json!({}), &[], Global),
     ];
     if include_launch {
