@@ -13,6 +13,7 @@ use crate::playback::{Engine, Quality, Snapshot};
 use crate::shortcuts::{self, Command};
 use crate::theme;
 use crate::timecode::{self, frame_index, frame_time};
+use crate::viewer::{button_w, fitting, text_w};
 use aiframes_core::{resolve, Id, MediaAsset, MediaKind, Project};
 use aiframes_mcp::actions::SourceEdit;
 use aiframes_mcp::SourceView;
@@ -344,6 +345,9 @@ impl SourceMonitor {
         let mut out = SourceOut::default();
         let pal = theme::palette();
         self.rect = ui.max_rect();
+        // Whatever still does not fit in a very narrow monitor is cut off, never drawn over the
+        // program viewer beside it.
+        ui.set_clip_rect(ui.clip_rect().intersect(self.rect));
         if let Some(l) = &self.loaded {
             if l.doc != cx.doc {
                 self.pause();
@@ -353,23 +357,43 @@ impl SourceMonitor {
         let fps = self.fps();
         let dur = self.duration();
         let marks = self.marks();
-        // Header.
+        // Header. When narrow, the format label goes first, then the name is shortened (both stay
+        // in the name's hover text), so the close button never covers them.
         ui.horizontal(|ui| {
-            theme::panel_header(ui, "SOURCE");
-            if let Some(m) = &shown {
-                ui.label(RichText::new(aiframes_ui::util::media_name(m)).small().color(pal.text));
+            let sp = ui.spacing().item_spacing.x;
+            let info = shown.as_ref().map(|m| match m.kind {
+                MediaKind::Audio => format!("{} Hz · {} ch", m.info.audio_rate, m.info.audio_channels),
+                _ if m.info.width > 0 => format!("{}×{}{}", m.info.width, m.info.height, if m.kind == MediaKind::Video { format!(" · {} fps", crate::viewer::trim_fps(m.info.fps)) } else { String::new() }),
+                _ => String::new(),
+            });
+            let info_text = info.as_ref().map(|i| RichText::new(i).small().color(pal.text_dim));
+            let name = shown.as_ref().map(aiframes_ui::util::media_name).unwrap_or_default();
+            let title = RichText::new("SOURCE").small().strong().color(pal.text_dim);
+            let close = RichText::new("✕").small();
+            let required = text_w(ui, title.clone()) + sp + button_w(ui, close.clone(), 0.0);
+            let name_w = text_w(ui, RichText::new(&name).small()) + sp;
+            let with_info = fitting(ui.available_width(), required, &[name_w, info_text.as_ref().map(|i| text_w(ui, i.clone()) + sp).unwrap_or(0.0)]) >= 2;
+            let room = ui.available_width() - required - sp;
+            let mut short = name.clone();
+            let mut n = name.chars().count();
+            while !with_info && n > 1 && text_w(ui, RichText::new(&short).small()) > room {
+                n -= 1;
+                short = aiframes_ui::util::ellipsize(&name, n);
+            }
+            ui.label(title);
+            if shown.is_some() {
+                let tip = match &info {
+                    Some(i) if !i.is_empty() => format!("{name}\n{i}"),
+                    _ => name.clone(),
+                };
+                ui.label(RichText::new(short).small().color(pal.text)).on_hover_text(tip);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("✕").on_hover_text("Close the Source monitor (View ▸ Source Monitor brings it back)").clicked() {
+                if ui.small_button(close).on_hover_text("Close the Source monitor (View ▸ Source Monitor brings it back)").clicked() {
                     out.close = true;
                 }
-                if let Some(m) = &shown {
-                    let info = match m.kind {
-                        MediaKind::Audio => format!("{} Hz · {} ch", m.info.audio_rate, m.info.audio_channels),
-                        _ if m.info.width > 0 => format!("{}×{}{}", m.info.width, m.info.height, if m.kind == MediaKind::Video { format!(" · {} fps", crate::viewer::trim_fps(m.info.fps)) } else { String::new() }),
-                        _ => String::new(),
-                    };
-                    ui.label(RichText::new(info).small().color(pal.text_dim));
+                if let Some(i) = info_text.filter(|_| with_info) {
+                    ui.label(i);
                 }
             });
         });
@@ -506,15 +530,43 @@ impl SourceMonitor {
         // Marks and times.
         ui.horizontal(|ui| {
             let f = |v: Option<f64>| v.map(|v| timecode::timecode(v, fps)).unwrap_or_else(|| "--:--:--:--".into());
-            ui.label(RichText::new(format!("In {}", f(mi))).small().monospace().color(pal.text_dim));
-            ui.label(RichText::new(format!("Out {}", f(mo))).small().monospace().color(pal.text_dim));
+            let marks_tip = format!("In {} · Out {}", f(mi), f(mo));
+            let in_text = RichText::new(format!("In {}", f(mi))).small().monospace().color(pal.text_dim);
+            let out_text = RichText::new(format!("Out {}", f(mo))).small().monospace().color(pal.text_dim);
             let (a, b) = (mi.unwrap_or(0.0), mo.unwrap_or(dur));
-            if b > a && (mi.is_some() || mo.is_some()) {
-                ui.label(RichText::new(format!("({})", timecode::short_duration(b - a))).small().color(pal.accent));
+            let len = (b > a && (mi.is_some() || mo.is_some())).then(|| RichText::new(format!("({})", timecode::short_duration(b - a))).small().color(pal.accent));
+            let length = timecode::timecode(dur, fps);
+            let length_text = RichText::new(format!("/ {length}")).small().monospace().color(pal.text_dim);
+            let playhead = RichText::new(timecode::timecode(t, fps)).monospace().strong().color(pal.accent);
+            // The playhead always shows; then, while they fit: the length, the marked range's
+            // length, the in and out marks (as in the program viewer).
+            let sp = ui.spacing().item_spacing.x;
+            let shown = fitting(
+                ui.available_width(),
+                text_w(ui, playhead.clone()) + sp,
+                &[
+                    text_w(ui, length_text.clone()) + sp,
+                    len.as_ref().map(|l| text_w(ui, l.clone()) + sp).unwrap_or(0.0),
+                    text_w(ui, in_text.clone()) + text_w(ui, out_text.clone()) + 2.0 * sp,
+                ],
+            );
+            if shown >= 3 {
+                ui.label(in_text);
+                ui.label(out_text);
+            }
+            if shown >= 2 {
+                if let Some(l) = len {
+                    ui.label(l).on_hover_text(&marks_tip);
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(format!("/ {}", timecode::timecode(dur, fps))).small().monospace().color(pal.text_dim));
-                ui.label(RichText::new(timecode::timecode(t, fps)).monospace().strong().color(pal.accent));
+                if shown >= 1 {
+                    ui.label(length_text);
+                }
+                let r = ui.label(playhead);
+                if shown < 3 {
+                    r.on_hover_text(format!("Length {length} · {marks_tip}"));
+                }
             });
         });
         // Transport and edits.
@@ -526,27 +578,35 @@ impl SourceMonitor {
             };
             let playing = self.playing();
             let rate = self.engine.as_ref().map(|e| e.rate()).unwrap_or(0.0);
+            // Play, Insert and Overwrite always show; then, while they fit: frame steps, the mark
+            // buttons, clear marks, play in to out (all of them have shortcuts).
+            let b = |t: &str| button_w(ui, RichText::new(t).size(13.0), 26.0);
+            let required = b("▶") + button_w(ui, RichText::new("Insert").size(12.0), 0.0) + button_w(ui, RichText::new("Overwrite").size(12.0), 0.0);
+            let shown = fitting(ui.available_width(), required, &[b("⏴|") + b("|⏵"), b("{") + b("}") + 6.0, b("⌫"), b("⇥")]);
+            let (steps, marks, clear, in_out) = (shown >= 1, shown >= 2, shown >= 3, shown >= 4);
             let mut cmd = None;
-            if btn(ui, "{", "Mark in", Some(Command::SetIn), false) {
+            if marks && btn(ui, "{", "Mark in", Some(Command::SetIn), false) {
                 cmd = Some(Command::SetIn);
             }
-            if btn(ui, "}", "Mark out", Some(Command::SetOut), false) {
+            if marks && btn(ui, "}", "Mark out", Some(Command::SetOut), false) {
                 cmd = Some(Command::SetOut);
             }
-            if btn(ui, "⌫", "Clear in and out", Some(Command::ClearInOut), false) {
+            if clear && btn(ui, "⌫", "Clear in and out", Some(Command::ClearInOut), false) {
                 cmd = Some(Command::ClearInOut);
             }
-            ui.add_space(6.0);
-            if btn(ui, "⏴|", "Previous frame", Some(Command::FrameBack), false) {
+            if marks {
+                ui.add_space(6.0);
+            }
+            if steps && btn(ui, "⏴|", "Previous frame", Some(Command::FrameBack), false) {
                 cmd = Some(Command::FrameBack);
             }
             if btn(ui, if playing && rate > 0.0 { "⏸" } else { "▶" }, "Play / pause", Some(Command::PlayPause), playing) {
                 cmd = Some(Command::PlayPause);
             }
-            if btn(ui, "|⏵", "Next frame", Some(Command::FrameForward), false) {
+            if steps && btn(ui, "|⏵", "Next frame", Some(Command::FrameForward), false) {
                 cmd = Some(Command::FrameForward);
             }
-            if btn(ui, "⇥", "Play in to out", Some(Command::PlayFromIn), false) {
+            if in_out && btn(ui, "⇥", "Play in to out", Some(Command::PlayFromIn), false) {
                 cmd = Some(Command::PlayFromIn);
             }
             if let Some(c) = cmd {

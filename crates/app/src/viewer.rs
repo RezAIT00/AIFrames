@@ -228,39 +228,57 @@ impl Viewer {
         let pal = theme::palette();
         let s = &cx.project.settings;
         let fps = s.fps;
-        // Header.
+        // Whatever still does not fit in a very narrow viewer is cut off, never drawn over the
+        // Source monitor beside it.
+        let own = ui.available_rect_before_wrap();
+        ui.set_clip_rect(ui.clip_rect().intersect(own));
+        // Header. A narrow viewer (the Source monitor open beside it, a wide side panel) drops the
+        // format label, then the title, rather than drawing the controls over them.
         ui.horizontal(|ui| {
-            theme::panel_header(ui, "PROGRAM");
+            let lowered = cx.perf.lowered_from.filter(|_| self.quality == Quality::Auto);
+            let label = match lowered {
+                Some(_) => format!("Auto {:.0}%", cx.render_scale * 100.0),
+                None => self.quality.label().to_string(),
+            };
+            let tip = match lowered {
+                Some(from) => format!(
+                    "Preview resolution: rendering at {:.0}% (Auto lowered it from {:.0}% because playback was dropping frames; it goes back up after a smooth stretch). Pick Full or 1/2 to fix it.",
+                    cx.render_scale * 100.0,
+                    from * 100.0
+                ),
+                None => format!("Preview resolution (rendering at {:.0}%). Auto follows the viewer size and lowers it while playback drops frames.", cx.render_scale * 100.0),
+            };
+            let quality_w = if lowered.is_some() { 74.0 } else { 58.0 };
+            let format = format!("{}×{} · {} fps", s.width, s.height, trim_fps(fps));
+            let title = RichText::new("PROGRAM").small().strong().color(pal.text_dim);
+            let format_text = RichText::new(&format).small().color(pal.text_dim);
+            let sp = ui.spacing().item_spacing.x;
+            let optional = [combo_w(ui, self.zoom.label(), 54.0), button_w(ui, "Safe", 0.0), text_w(ui, title.clone()) + sp, text_w(ui, format_text.clone()) + sp];
+            let shown = fitting(ui.available_width(), combo_w(ui, &label, quality_w), &optional);
+            if shown >= 3 {
+                ui.label(title).on_hover_text(&format);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let lowered = cx.perf.lowered_from.filter(|_| self.quality == Quality::Auto);
-                let label = match lowered {
-                    Some(_) => format!("Auto {:.0}%", cx.render_scale * 100.0),
-                    None => self.quality.label().to_string(),
-                };
-                let tip = match lowered {
-                    Some(from) => format!(
-                        "Preview resolution: rendering at {:.0}% (Auto lowered it from {:.0}% because playback was dropping frames; it goes back up after a smooth stretch). Pick Full or 1/2 to fix it.",
-                        cx.render_scale * 100.0,
-                        from * 100.0
-                    ),
-                    None => format!("Preview resolution (rendering at {:.0}%). Auto follows the viewer size and lowers it while playback drops frames.", cx.render_scale * 100.0),
-                };
-                egui::ComboBox::from_id_salt("viewer-quality").width(if lowered.is_some() { 74.0 } else { 58.0 }).selected_text(label).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("viewer-quality").width(quality_w).selected_text(label).show_ui(ui, |ui| {
                     for q in Quality::ALL {
                         ui.selectable_value(&mut self.quality, q, q.label());
                     }
                 }).response.on_hover_text(tip);
-                egui::ComboBox::from_id_salt("viewer-zoom").width(54.0).selected_text(self.zoom.label()).show_ui(ui, |ui| {
-                    for z in Zoom::ALL {
-                        if ui.selectable_value(&mut self.zoom, z, z.label()).clicked() {
-                            self.pan = Vec2::ZERO;
+                if shown >= 1 {
+                    egui::ComboBox::from_id_salt("viewer-zoom").width(54.0).selected_text(self.zoom.label()).show_ui(ui, |ui| {
+                        for z in Zoom::ALL {
+                            if ui.selectable_value(&mut self.zoom, z, z.label()).clicked() {
+                                self.pan = Vec2::ZERO;
+                            }
                         }
-                    }
-                });
-                if ui.selectable_label(self.safe, "Safe").on_hover_text(format!("Title/action-safe guides ({})", shortcuts::label(Command::ToggleSafe))).clicked() {
+                    });
+                }
+                if shown >= 2 && ui.selectable_label(self.safe, "Safe").on_hover_text(format!("Title/action-safe guides ({})", shortcuts::label(Command::ToggleSafe))).clicked() {
                     self.safe = !self.safe;
                 }
-                ui.label(RichText::new(format!("{}×{} · {} fps", s.width, s.height, trim_fps(fps))).small().color(pal.text_dim));
+                if shown >= 4 {
+                    ui.label(format_text);
+                }
             });
         });
         // Transport goes at the bottom; the picture takes the rest.
@@ -561,13 +579,41 @@ impl Viewer {
         let fps = cx.project.settings.fps;
         ui.horizontal(|ui| {
             let f = |v: Option<f64>| v.map(|v| timecode::timecode(v, fps)).unwrap_or_else(|| "--:--:--:--".into());
-            ui.label(RichText::new(format!("In {}", f(cx.in_point))).small().monospace().color(pal.text_dim));
-            ui.label(RichText::new(format!("Out {}", f(cx.out_point))).small().monospace().color(pal.text_dim));
-            if let (Some(a), Some(b)) = (cx.in_point, cx.out_point) {
-                ui.label(RichText::new(format!("({})", timecode::short_duration(b - a))).small().color(pal.text_dim));
+            let marks_tip = format!("In {} · Out {}", f(cx.in_point), f(cx.out_point));
+            let in_text = RichText::new(format!("In {}", f(cx.in_point))).small().monospace().color(pal.text_dim);
+            let out_text = RichText::new(format!("Out {}", f(cx.out_point))).small().monospace().color(pal.text_dim);
+            let len = match (cx.in_point, cx.out_point) {
+                (Some(a), Some(b)) => Some(RichText::new(format!("({})", timecode::short_duration(b - a))).small().color(pal.text_dim)),
+                _ => None,
+            };
+            let length = timecode::timecode(cx.resolved.duration, fps);
+            let length_text = RichText::new(format!("/ {length}")).small().monospace().color(pal.text_dim);
+            // The playhead always shows; then, while they fit: the length, the marked range's
+            // length, the in and out marks.
+            let sp = ui.spacing().item_spacing.x;
+            let playhead_w = if self.tc_edit.is_some() { 96.0 + 2.0 * ui.spacing().button_padding.x } else { text_w(ui, RichText::new(timecode::timecode(cx.playhead, fps)).monospace().strong()) } + sp;
+            let shown = fitting(
+                ui.available_width(),
+                playhead_w,
+                &[
+                    text_w(ui, length_text.clone()) + sp,
+                    len.as_ref().map(|l| text_w(ui, l.clone()) + sp).unwrap_or(0.0),
+                    text_w(ui, in_text.clone()) + text_w(ui, out_text.clone()) + 2.0 * sp,
+                ],
+            );
+            if shown >= 3 {
+                ui.label(in_text);
+                ui.label(out_text);
+            }
+            if shown >= 2 {
+                if let Some(l) = len {
+                    ui.label(l).on_hover_text(&marks_tip);
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(format!("/ {}", timecode::timecode(cx.resolved.duration, fps))).small().monospace().color(pal.text_dim));
+                if shown >= 1 {
+                    ui.label(length_text);
+                }
                 let tc = timecode::timecode(cx.playhead, fps);
                 match &mut self.tc_edit {
                     Some(buf) => {
@@ -585,7 +631,8 @@ impl Viewer {
                     }
                     None => {
                         let r = ui.add(egui::Label::new(RichText::new(&tc).monospace().strong().color(pal.accent)).sense(Sense::click()));
-                        if r.on_hover_text("Click to go to a time (timecode, seconds or frames like 45f)").clicked() {
+                        let tip = if shown >= 3 { String::new() } else { format!("\nLength {length} · {marks_tip}") };
+                        if r.on_hover_text(format!("Click to go to a time (timecode, seconds or frames like 45f){tip}")).clicked() {
                             self.tc_edit = Some(tc);
                         }
                     }
@@ -599,54 +646,95 @@ impl Viewer {
                 let tip = if sc.is_empty() { tip.to_string() } else { format!("{tip} ({sc})") };
                 ui.add(b).on_hover_text(tip).clicked()
             };
-            let w = 7.0 * 32.0 + 3.0 * 32.0 + 20.0;
-            let pad = ((ui.available_width() - w - 150.0) / 2.0).max(0.0);
-            if btn(ui, "{", "Set in", Command::SetIn, false) {
+            // Play and mute always show; then, while they fit: frame steps, play backward, the
+            // volume slider, the mark buttons, loop, go to start/end, play in to out (all of them
+            // have shortcuts).
+            let b = |t: &str| button_w(ui, RichText::new(t).size(14.0), 28.0);
+            let required = b("▶") + button_w(ui, "🔊", 0.0);
+            let parts = [b("⏴|") + b("|⏵"), b("◀"), ui.spacing().slider_width + ui.spacing().item_spacing.x, b("{") + b("}"), b("⟲"), b("⏮") + b("⏭"), b("⇥")];
+            let shown = fitting(ui.available_width(), required, &parts);
+            let used = required + parts[..shown].iter().sum::<f32>();
+            let (steps, reverse, slider, marks, looping, ends, in_out) = (shown >= 1, shown >= 2, shown >= 3, shown >= 4, shown >= 5, shown >= 6, shown >= 7);
+            let pad = ((ui.available_width() - used) / 2.0).max(0.0);
+            if marks && btn(ui, "{", "Set in", Command::SetIn, false) {
                 out.commands.push(Command::SetIn);
             }
-            if btn(ui, "}", "Set out", Command::SetOut, false) {
+            if marks && btn(ui, "}", "Set out", Command::SetOut, false) {
                 out.commands.push(Command::SetOut);
             }
             ui.add_space(pad);
-            if btn(ui, "⏮", "Go to start", Command::GoStart, false) {
+            if ends && btn(ui, "⏮", "Go to start", Command::GoStart, false) {
                 out.commands.push(Command::GoStart);
             }
-            if btn(ui, "⏴|", "Previous frame", Command::FrameBack, false) {
+            if steps && btn(ui, "⏴|", "Previous frame", Command::FrameBack, false) {
                 out.commands.push(Command::FrameBack);
             }
-            if btn(ui, "◀", "Play backward", Command::ShuttleReverse, cx.rate < 0.0) {
+            if reverse && btn(ui, "◀", "Play backward", Command::ShuttleReverse, cx.rate < 0.0) {
                 out.commands.push(Command::ShuttleReverse);
             }
             let play = if cx.playing { "⏸" } else { "▶" };
             if btn(ui, play, "Play / pause", Command::PlayPause, cx.playing && cx.rate > 0.0) {
                 out.commands.push(Command::PlayPause);
             }
-            if btn(ui, "|⏵", "Next frame", Command::FrameForward, false) {
+            if steps && btn(ui, "|⏵", "Next frame", Command::FrameForward, false) {
                 out.commands.push(Command::FrameForward);
             }
-            if btn(ui, "⏭", "Go to end", Command::GoEnd, false) {
+            if ends && btn(ui, "⏭", "Go to end", Command::GoEnd, false) {
                 out.commands.push(Command::GoEnd);
             }
-            if btn(ui, "⟲", "Loop playback", Command::ToggleLoop, cx.looping) {
+            if looping && btn(ui, "⟲", "Loop playback", Command::ToggleLoop, cx.looping) {
                 out.commands.push(Command::ToggleLoop);
             }
-            if btn(ui, "⇥", "Play in to out", Command::PlayFromIn, false) {
+            if in_out && btn(ui, "⇥", "Play in to out", Command::PlayFromIn, false) {
                 out.commands.push(Command::PlayFromIn);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut v = cx.volume;
                 let mut muted = cx.muted;
-                let r = ui.add(egui::Slider::new(&mut v, 0.0..=1.5).show_value(false)).on_hover_text(format!("Volume {:.0}%", v * 100.0));
-                if ui.selectable_label(muted, if muted { "🔇" } else { "🔊" }).on_hover_text("Mute").clicked() {
+                let changed = slider && ui.add(egui::Slider::new(&mut v, 0.0..=1.5).show_value(false)).on_hover_text(format!("Volume {:.0}%", v * 100.0)).changed();
+                if ui.selectable_label(muted, if muted { "🔇" } else { "🔊" }).on_hover_text(format!("Mute (volume {:.0}%)", v * 100.0)).clicked() {
                     muted = !muted;
                     out.volume = Some((v, muted));
                 }
-                if r.changed() {
+                if changed {
                     out.volume = Some((v, muted));
                 }
             });
         });
     }
+}
+
+/// Width of `text` drawn as a label in `ui`, in points.
+pub(crate) fn text_w(ui: &egui::Ui, text: impl Into<egui::WidgetText>) -> f32 {
+    text.into().into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body).size().x
+}
+
+/// Width a button showing `text` takes in a row (at least `min` wide), with the gap after it.
+pub(crate) fn button_w(ui: &egui::Ui, text: impl Into<egui::WidgetText>, min: f32) -> f32 {
+    let s = ui.spacing();
+    (text_w(ui, text) + 2.0 * s.button_padding.x).max(min) + s.item_spacing.x
+}
+
+/// Width a combo box showing `text` takes in a row (at least `min` wide), with the gap after it.
+fn combo_w(ui: &egui::Ui, text: &str, min: f32) -> f32 {
+    let s = ui.spacing();
+    (text_w(ui, text) + s.icon_width + s.item_spacing.x + 2.0 * s.button_padding.x).max(min) + s.item_spacing.x
+}
+
+/// How many of a row's optional parts to draw: `required` points always show, `optional` lists the
+/// other parts' widths from most to least useful, and parts are kept in that order while they fit.
+/// The monitors get narrow (the Source monitor beside the program viewer, a wide side panel), and
+/// egui draws a row's right-aligned group over its left one when both don't fit, so the rows drop
+/// parts instead (what a dropped part said stays in a hover text, and every button has a shortcut).
+pub(crate) fn fitting(avail: f32, required: f32, optional: &[f32]) -> usize {
+    let mut used = required;
+    optional
+        .iter()
+        .take_while(|w| {
+            used += **w;
+            used <= avail
+        })
+        .count()
 }
 
 pub(crate) fn trim_fps(fps: f64) -> String {
@@ -688,6 +776,15 @@ mod tests {
 
     fn clip(json: serde_json::Value) -> Clip {
         serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn narrow_rows_drop_their_least_useful_parts_first() {
+        assert_eq!(fitting(500.0, 100.0, &[50.0, 50.0, 50.0]), 3, "everything fits");
+        assert_eq!(fitting(220.0, 100.0, &[50.0, 50.0, 50.0]), 2);
+        assert_eq!(fitting(120.0, 100.0, &[50.0, 10.0]), 0, "a small part never jumps a wider, more useful one");
+        assert_eq!(fitting(90.0, 100.0, &[10.0]), 0, "too narrow even for the required part");
+        assert_eq!(fitting(200.0, 100.0, &[0.0, 100.0]), 2, "an empty part costs nothing");
     }
 
     #[test]
