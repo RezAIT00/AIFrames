@@ -62,6 +62,11 @@ pub enum FrameCaching {
     /// Not cached at all (frames already cached are still returned). Only for a single consumer
     /// reading strictly forward: other readers of the same times would have to decode again.
     Off,
+    /// Cached like `Normal`, but decoded by a session of its own: never one that playback or
+    /// export is reading from (a request ahead of their position would move it past them and
+    /// make them seek back). Playback opens the next clip's decoder this way before a cut.
+    /// Skipped (an error) when every decoder of the file is busy.
+    Ahead,
 }
 
 /// Counters for diagnostics (`MediaPool::stats`).
@@ -120,6 +125,20 @@ const SMALL_PIXELS: u64 = 480 * 270;
 const THUMB_STEP: f64 = 0.1;
 /// Files with at most this much audio are decoded completely inside `audio()`.
 const SYNC_AUDIO_SECS: f64 = 30.0;
+
+/// Whether `HwAccel::Auto` decodes this stream on the GPU: streams whose CPU decode is the
+/// bottleneck and that GPUs decode (HEVC, VP9, AV1, and 8-bit 4:2:0 H.264 above 1440p); see
+/// `HwAccel` for the measurements. Everything else (1080p H.264, 10-bit H.264, ProRes, DNxHD, ...)
+/// stays on the CPU.
+fn auto_wants_gpu(p: &Probed) -> bool {
+    let codec = p.info.codec.to_ascii_lowercase();
+    let big = p.info.width as u64 * p.info.height as u64 > 2560 * 1440;
+    match codec.as_str() {
+        "hevc" | "h265" | "vp9" | "av1" => true,
+        "h264" => big && matches!(p.pix_fmt.as_str(), "yuv420p" | "yuvj420p" | "nv12"),
+        _ => false,
+    }
+}
 
 /// Short files are decoded inside `audio()`; an unknown (0 / NaN) duration counts as long.
 fn decode_synchronously(duration: f64) -> bool {
@@ -532,22 +551,31 @@ impl MediaPool {
             .filter(|s| !s.pos().is_nan() && s.seq.load(Ordering::Relaxed) >= SEQUENTIAL && now.saturating_sub(s.last_used.load(Ordering::Relaxed)) < 2000)
             .count()
             .max(1);
-        let share = self.readahead_budget.load(Ordering::Relaxed) / active;
+        // A quarter of the budget stays free for the current/next frames of the other sessions
+        // (a decoder opened ahead of a cut, a transition's second clip): readahead filling the
+        // whole budget made `enforce_budget` close exactly those.
+        let share = self.readahead_budget.load(Ordering::Relaxed) / 4 * 3 / active;
         (share / frame_bytes.max(1)).clamp(1, 24).min(2usize << seq.min(4))
     }
 
     /// While sessions hold more than the budget, closes the least recently used idle ones
-    /// (never one used in the last `ACTIVE_MS`, never `keep`).
+    /// (never one used in the last `ACTIVE_MS`, never `keep`). Sessions opened in the last
+    /// `PROVISIONAL_IDLE` for a single request (playback opens the next clip's decoder ahead of a
+    /// cut) are only closed when memory is well over the budget.
     fn enforce_budget(&self, keep: Option<&Arc<Slot>>) {
         let budget = self.readahead_budget.load(Ordering::Relaxed);
-        if self.session_mem.load(Ordering::Relaxed) <= budget {
+        let used = self.session_mem.load(Ordering::Relaxed);
+        if used <= budget {
             return;
         }
+        let critical = used > budget / 2 * 3;
         let now = self.now_ms();
+        let fresh = |s: &Slot| s.seq.load(Ordering::Relaxed) < SEQUENTIAL && now.saturating_sub(s.last_used.load(Ordering::Relaxed)) < PROVISIONAL_IDLE.as_millis() as u64;
         let mut slots: Vec<Arc<Slot>> = lock(&self.groups)
             .values()
             .flatten()
             .filter(|s| !s.pos().is_nan() && now.saturating_sub(s.last_used.load(Ordering::Relaxed)) >= ACTIVE_MS)
+            .filter(|s| critical || !fresh(s))
             .filter(|s| keep.is_none_or(|k| !Arc::ptr_eq(k, s)))
             .cloned()
             .collect();
@@ -569,6 +597,7 @@ impl MediaPool {
             return HwAccel::Off;
         }
         match self.hwaccel() {
+            HwAccel::Auto if cfg!(windows) && auto_wants_gpu(p) => HwAccel::D3d11va,
             HwAccel::Auto => HwAccel::Off,
             other => other,
         }
@@ -592,11 +621,14 @@ impl MediaPool {
         }
     }
 
-    /// Picks the session best placed to serve `t` (creating one if needed).
-    fn pick(&self, key: StreamKey, t: f64, eps: f64, jump: f64) -> (Arc<Slot>, bool) {
+    /// Picks the session best placed to serve `t` (creating one if needed). `ahead`: never a
+    /// session in sequential or recent use, and none at all when every slot is taken.
+    fn pick(&self, key: StreamKey, t: f64, eps: f64, jump: f64, ahead: bool) -> Option<(Arc<Slot>, bool)> {
         let mut groups = lock(&self.groups);
         self.reap(&mut groups);
+        let now = self.now_ms();
         let g = groups.entry(key).or_default();
+        let busy = |s: &Slot| s.seq.load(Ordering::Relaxed) >= SEQUENTIAL || now.saturating_sub(s.last_used.load(Ordering::Relaxed)) < ACTIVE_MS;
         let stepping_back = g.iter().any(|s| {
             let d = s.pos() - t;
             d > eps && d <= BACK_STEP
@@ -604,7 +636,7 @@ impl MediaPool {
         let mut best: Option<(f64, &Arc<Slot>)> = None;
         for s in g.iter() {
             let pos = s.pos();
-            if pos.is_nan() {
+            if pos.is_nan() || (ahead && busy(s)) {
                 continue;
             }
             let ahead_ok = pos <= t + eps || s.serves_earlier.load(Ordering::Relaxed);
@@ -614,21 +646,21 @@ impl MediaPool {
             }
         }
         if let Some((_, s)) = best {
-            return (s.clone(), false);
+            return Some((s.clone(), false));
         }
         // Not taking over the session we stepped back from: in a crossfade between two overlapping
         // parts of one file, both sessions keep streaming.
         // Prefer an idle (unstarted or unlocked) slot, else open another one, else the least recent.
         if let Some(s) = g.iter().find(|s| s.pos().is_nan() && s.session.try_lock().is_ok()) {
-            return (s.clone(), stepping_back);
+            return Some((s.clone(), stepping_back));
         }
         if g.len() < MAX_PER_KEY {
             let s = Arc::new(Slot::new());
             g.push(s.clone());
-            return (s, stepping_back);
+            return Some((s, stepping_back));
         }
-        let s = g.iter().min_by_key(|s| s.last_used.load(Ordering::Relaxed)).cloned().expect("non-empty group");
-        (s, stepping_back)
+        let s = g.iter().filter(|s| !ahead || !busy(s)).min_by_key(|s| s.last_used.load(Ordering::Relaxed)).cloned()?;
+        Some((s, stepping_back))
     }
 
     /// Closes idle sessions and enforces the global session cap (never blocks on a busy session).
@@ -672,7 +704,10 @@ impl MediaPool {
 
     fn decode(&self, key: StreamKey, spec: SessionSpec, p: &Probed, t: f64, eps: f64, caching: FrameCaching) -> Result<Frame> {
         let jump = (60.0 / spec.fps).clamp(0.25, 2.0);
-        let (slot, stepping_back) = self.pick(key, t, eps, jump);
+        let ahead = caching == FrameCaching::Ahead;
+        let Some((slot, stepping_back)) = self.pick(key, t, eps, jump, ahead) else {
+            return Err(MediaError::InvalidInput(format!("no free decoder to read {} ahead", spec.path.display())));
+        };
         self.decode_in(slot, stepping_back, key, spec, p, t, eps, caching)
     }
 
@@ -725,8 +760,18 @@ impl MediaPool {
                 let pre = prerolls[attempt];
                 let seek = if pre.is_infinite() || t - pre < 0.3 { 0.0 } else { t - pre };
                 *guard = None; // kill the old process before starting the next
+                // Requests for the next frames (other render workers) wait for this session
+                // instead of starting their own at nearly the same place.
+                slot.pos.store(seek.to_bits(), Ordering::Relaxed);
+                slot.serves_earlier.store(seek <= 0.0, Ordering::Relaxed);
                 self.seeks.fetch_add(1, Ordering::Relaxed);
-                let mut s = self.start_session(&spec, seek)?;
+                let mut s = match self.start_session(&spec, seek) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        slot.publish(None);
+                        return Err(e);
+                    }
+                };
                 if let Some(hi) = empty_at {
                     // The video ends inside [seek, hi): bisect to within 2 s before decoding through.
                     if hi - seek > 2.0 && s.has_frames().unwrap_or(false) {
@@ -1159,7 +1204,38 @@ fn load_raw_frame(path: &Path, time: f64) -> Option<Frame> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_synchronously;
+    use super::{auto_wants_gpu, decode_synchronously};
+    use crate::probe::Probed;
+    use aiframes_core::model::{MediaInfo, MediaKind};
+
+    fn probed(codec: &str, pix_fmt: &str, w: u32, h: u32) -> Probed {
+        Probed {
+            kind: MediaKind::Video,
+            info: MediaInfo { codec: codec.into(), width: w, height: h, ..Default::default() },
+            video_index: Some(0),
+            audio_index: None,
+            video_end: 10.0,
+            video_start: 0.0,
+            video_end_exact: true,
+            vfr: false,
+            untagged_matrix: false,
+            vpx_alpha: None,
+            pix_fmt: pix_fmt.into(),
+            format_name: "mov,mp4,m4a,3gp,3g2,mj2".into(),
+        }
+    }
+
+    #[test]
+    fn auto_hardware_decoding_is_for_heavy_streams() {
+        assert!(!auto_wants_gpu(&probed("h264", "yuv420p", 1920, 1080)), "8-bit H.264 1080p stays on the CPU");
+        assert!(!auto_wants_gpu(&probed("h264", "yuv420p", 2560, 1440)));
+        assert!(auto_wants_gpu(&probed("h264", "yuv420p", 3840, 2160)), "4K");
+        assert!(auto_wants_gpu(&probed("hevc", "yuv420p", 1920, 1080)), "HEVC");
+        assert!(auto_wants_gpu(&probed("hevc", "yuv420p10le", 3840, 2160)), "10-bit HEVC");
+        assert!(auto_wants_gpu(&probed("av1", "yuv420p", 1280, 720)));
+        assert!(!auto_wants_gpu(&probed("h264", "yuv420p10le", 3840, 2160)), "GPUs do not decode 10-bit H.264");
+        assert!(!auto_wants_gpu(&probed("prores", "yuv422p10le", 3840, 2160)), "no GPU decoder");
+    }
 
     #[test]
     fn only_known_short_durations_decode_inside_audio() {
