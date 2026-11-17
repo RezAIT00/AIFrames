@@ -2279,7 +2279,7 @@ impl eframe::App for AiFramesApp {
             // (added) Effect thumbnails follow the document, selection and playhead (when shown).
             if self.side_tab == SideTab::Effects && self.prefs.layout.show_side {
                 if let Some((snap, sel)) = self.docs.get(id).and_then(|d| Some((d.snap.clone()?, d.selection.clone()))) {
-                    let scrubbing = ctx.input(|i| i.pointer.primary_down()) || self.viewer.dragging();
+                    let scrubbing = ctx.input(|i| i.pointer.primary_down()) || self.viewer.dragging() || self.fx_hover.holds_playhead();
                     self.fx.set_base(&snap, &sel, playhead, self.engine.playing(), scrubbing, self.now);
                 }
             }

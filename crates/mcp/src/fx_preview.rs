@@ -58,17 +58,23 @@ pub fn cut_of(p: &Project, r: &Resolved, clip: &str) -> Option<(Id, Id)> {
     on.iter().find(|(k, ks)| k.id != clip && (ks.end - s.start).abs() < 1e-3).map(|(k, _)| (k.id.clone(), clip.to_string()))
 }
 
-/// The ops for a `kind` transition on the cut `from|to` (changing the kind of one already there) and
-/// the timeline time of the cut, where the transition is half way.
-pub fn transition_ops(p: &Project, r: &Resolved, from: &str, to: &str, kind: &str) -> Option<(Vec<Op>, f64)> {
+/// The ops for a `kind` transition on the cut `from|to` (changing the kind of one already there), the
+/// timeline time of the cut (where the transition is half way) and the transition's duration.
+pub fn transition_ops(p: &Project, r: &Resolved, from: &str, to: &str, kind: &str) -> Option<(Vec<Op>, f64, f64)> {
     let at = r.span(to)?.start;
     if let Some(t) = p.transitions.iter().find(|t| t.from == from && t.to == to) {
-        return Some((vec![Op::SetTransition { transition: t.id.clone(), kind: Some(kind.into()), duration: None, params: Default::default() }], at));
+        return Some((vec![Op::SetTransition { transition: t.id.clone(), kind: Some(kind.into()), duration: None, params: Default::default() }], at, t.duration));
     }
     let spec = transition_spec(kind)?;
     let max = r.span(from)?.duration().min(r.span(to)?.duration());
     let d = spec.default_duration.min(max);
-    Some((vec![Op::AddTransition { from: from.into(), to: to.into(), kind: kind.into(), duration: Some(d), id: None, params: Default::default() }], at))
+    Some((vec![Op::AddTransition { from: from.into(), to: to.into(), kind: kind.into(), duration: Some(d), id: None, params: Default::default() }], at, d))
+}
+
+/// Where a still of a transition is taken: 35 % of the way through (half way, a dip is only its colour
+/// and a push only the outgoing edge). The effects browser uses the same moment.
+pub fn transition_still(cut: f64, duration: f64) -> f64 {
+    cut - duration / 2.0 + duration * 0.35
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -384,8 +390,8 @@ mod tests {
         // A transition on the sample cut renders half way at the cut time.
         let r = resolve(&p);
         assert_eq!(cut_of(&p, &r, SAMPLE_A), Some((SAMPLE_A.to_string(), SAMPLE_B.to_string())));
-        let (ops, at) = transition_ops(&p, &r, SAMPLE_A, SAMPLE_B, "wipe_left").unwrap();
-        assert_eq!(at, 4.0);
+        let (ops, at, d) = transition_ops(&p, &r, SAMPLE_A, SAMPLE_B, "wipe_left").unwrap();
+        assert_eq!((at, d), (4.0, 0.5));
         let mid = render(&rd, &dir, &scratch(&p, &ops).unwrap(), at, 192).unwrap();
         let (l, rr) = (mean(&mid, 0.0, 0.0, 0.3, 0.3), mean(&mid, 0.7, 0.0, 1.0, 0.3));
         let (al, br) = (mean(&plain, 0.0, 0.0, 0.3, 0.3), mean(&render(&rd, &dir, &scratch(&p, &[]).unwrap(), 6.0, 192).unwrap(), 0.7, 0.0, 1.0, 0.3));

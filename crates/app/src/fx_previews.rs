@@ -18,7 +18,7 @@ use crate::playback::Snapshot;
 use aiframes_core::Id;
 use aiframes_mcp::fx_preview::{self as fxp, Scratch};
 use aiframes_render::Renderer;
-use aiframes_ui::effects_browser::{anim_time, preview_plan, BrowserDrag, FxPreview, PreviewPlan, ANIM_FRAMES, PRESET_SETTLE};
+use aiframes_ui::effects_browser::{anim_time, preview_plan, still_time, BrowserDrag, FxPreview, PreviewPlan, ANIM_FRAMES, PRESET_SETTLE};
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -260,11 +260,11 @@ impl Inner {
     }
 }
 
-/// When to render: the plan's moment, or a frame of a transition's animation.
+/// When to render: the plan's still, or a frame of a transition's animation.
 fn at_of(plan: &PreviewPlan, frame: u32) -> f64 {
     match (frame, plan.span) {
         (1.., Some(span)) => anim_time(span, frame),
-        _ => plan.at,
+        _ => still_time(plan),
     }
 }
 
@@ -326,6 +326,11 @@ fn worker(inner: Arc<Inner>) {
 
 /// Pointer rest on an item before the viewer previews it (moving across the list does not thrash).
 const DWELL: f64 = 0.15;
+/// Steps per second of a transition looping in the viewer while hovered, and steps held at its end.
+const LOOP_RATE: f64 = 12.0;
+const LOOP_HOLD: u64 = 5;
+/// Most steps one pass of the loop takes (long transitions are sampled more coarsely).
+const LOOP_STEPS: u64 = 18;
 
 /// Drives the live preview of the hovered browser item in the program viewer. After a short dwell it
 /// returns, every frame, the ops of what a click would do; the app shows them through its transient
@@ -342,8 +347,10 @@ pub struct HoverCtl {
     plan: Option<(BrowserDrag, (u64, u64, u64), Vec<Id>, Option<PreviewPlan>)>,
     /// (document, playhead before the preview moved it, where it moved it).
     restore: Option<(u64, f64, f64)>,
-    /// The playhead was checked for this plan.
+    /// The playhead was checked for this plan (and since when a transition loops in the viewer).
     placed: bool,
+    loop_start: f64,
+    loop_step: Option<u64>,
     suppressed: Option<BrowserDrag>,
     /// Text for the viewer overlay while previewing (or why nothing previews).
     pub note: Option<String>,
@@ -352,6 +359,11 @@ pub struct HoverCtl {
 }
 
 impl HoverCtl {
+    /// True while the hover preview has moved the playhead (thumbnails do not follow it then).
+    pub fn holds_playhead(&self) -> bool {
+        self.restore.is_some()
+    }
+
     /// Per UI frame. `hovered` is the browser's hovered item (`None` when the browser is not shown),
     /// `clicked` whether the browser emitted an action this frame. Returns the ops to preview now.
     #[allow(clippy::too_many_arguments)]
@@ -394,18 +406,36 @@ impl HoverCtl {
             });
             return None;
         };
-        // Show it where it can be seen: on the cut, inside the clip, after a title's reveal.
-        if !self.placed && !engine.playing() {
-            self.placed = true;
+        // Show it where it can be seen: inside the clip, after a title's reveal; a transition loops
+        // through its frames (paused only: playing, the person watches it go by).
+        if !engine.playing() {
             let t = engine.time();
-            let visible = match plan.span {
-                Some((a, b)) => t >= a && t < b,
-                None => (t - plan.at).abs() < 0.5 / doc.fps(),
-            };
-            if !visible {
-                let back = self.restore.map(|(_, b, _)| b).unwrap_or(t);
-                engine.seek(plan.at, false);
-                self.restore = Some((doc.doc, back, engine.time()));
+            let back = self.restore.map(|(_, b, _)| b).unwrap_or(t);
+            match plan.span {
+                Some((a, b)) => {
+                    if !self.placed {
+                        self.placed = true;
+                        self.loop_start = now;
+                        self.loop_step = None;
+                    }
+                    let frames = (((b - a) * doc.fps()).round() as u64).clamp(2, LOOP_STEPS);
+                    let k = ((now - self.loop_start).max(0.0) * LOOP_RATE) as u64 % (frames + LOOP_HOLD);
+                    let k = k.min(frames - 1);
+                    if self.loop_step != Some(k) {
+                        self.loop_step = Some(k);
+                        engine.seek(a + (b - a) * (k as f64 + 0.5) / frames as f64, false);
+                        self.restore = Some((doc.doc, back, engine.time()));
+                    }
+                    ctx.request_repaint_after(Duration::from_secs_f64(0.5 / LOOP_RATE));
+                }
+                None if !self.placed => {
+                    self.placed = true;
+                    if (t - plan.at).abs() >= 0.5 / doc.fps() {
+                        engine.seek(plan.at, false);
+                        self.restore = Some((doc.doc, back, engine.time()));
+                    }
+                }
+                None => {}
             }
         }
         self.previewing = true;
@@ -423,6 +453,7 @@ impl HoverCtl {
         }
         self.plan = None;
         self.placed = false;
+        self.loop_step = None;
         self.previewing = false;
         self.note = None;
     }

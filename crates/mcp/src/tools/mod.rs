@@ -1,6 +1,7 @@
 //! Tool implementations. Every edit goes through `Document::apply` (undoable, attributed), records
 //! what the AI changed for the GUI, posts a notice to the AI log and wakes the window.
 
+mod fx;
 mod joins;
 mod media;
 mod project;
@@ -268,6 +269,7 @@ fn dispatch(s: &Arc<Services>, name: &str, args: &J) -> ToolResult {
         "snapshot" => view::snapshot(s, args),
         "contact_sheet" => view::contact_sheet(s, args),
         "filmstrip" => view::filmstrip(s, args),
+        "preview_effects" => fx::preview_effects(s, args),
         // transcript, analysis, jobs
         "transcribe" => media::transcribe(s, args),
         "get_transcript" => media::get_transcript(s, args),

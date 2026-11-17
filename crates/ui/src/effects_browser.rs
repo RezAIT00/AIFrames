@@ -220,6 +220,15 @@ pub fn preview_plan(item: &BrowserDrag, p: &Project, r: &Resolved, selection: &[
     }
 }
 
+/// (added) The time a still of the plan shows: its moment, or for a transition 35 % of the way through
+/// (half way, a dip is only its colour and a push only the outgoing edge).
+pub fn still_time(plan: &PreviewPlan) -> f64 {
+    match plan.span {
+        Some((a, b)) => a + (b - a) * 0.35,
+        None => plan.at,
+    }
+}
+
 /// (added) The time of animation frame `k` (1..=ANIM_FRAMES) of a transition spanning `span`: from just
 /// after its start to just before its end.
 pub fn anim_time(span: (f64, f64), k: u32) -> f64 {
