@@ -2,7 +2,7 @@
 //! crop → fit → transform → effects → opacity × fade → blend onto the canvas. Adjustment clips
 //! apply their effects to the composite below. Transitions combine both clips around the cut.
 
-use crate::canvas::{accumulate, accumulate_res, blend_layer, draw_raster, draw_raster_over, over_union, premul, transform_layer, AccItem, AccSource, Layer, Picture, Px, RasterDraw};
+use crate::canvas::{accumulate, accumulate_res, blend_layer, draw_raster, draw_raster_over, mix_layers, over_union, premul, transform_layer, AccItem, AccSource, Layer, Picture, Px, RasterDraw};
 use crate::effects::{apply_effects, shake_offset, FxCtx};
 use crate::geom::{m3_apply, m3_mul, plane_homography, rot_x, rot_y, rot_z, Affine, IRect, Proj};
 use crate::text::{self, TextLayout, TextState};
@@ -876,32 +876,56 @@ fn clip_full(cx: &Ctx, clip: &Clip, span: Span, depth: u32) -> Result<Option<Lay
     let t_frame = local_time(cx.t, &span, cx.tl.tol);
     let t = stutter_time(clip, t_frame);
     let mut out = clip_core(cx, clip, t, t_frame)?;
-    // Echo: the clip as it was k × interval earlier, under itself, at decay^k.
+    // Echo: the clip as it was k × interval earlier at decay^k, under itself (cut-outs, text) or
+    // blended over it (footage that fills the frame, which would hide echoes behind it).
     if let Some(e) = clip.effects.iter().find(|e| e.enabled && e.kind == "echo") {
         use aiframes_core::effects::effect_param;
         let count = effect_param(e, "count", t).round().clamp(1.0, 32.0) as usize;
         let interval = effect_param(e, "interval", t).clamp(0.001, 60.0);
         let decay = effect_param(e, "decay", t).clamp(0.0, 1.0);
-        let mut acc: Option<Layer> = None;
+        let blend = match effect_param(e, "mode", t).round() as i64 {
+            1 => false,
+            2 => true,
+            _ => out.as_ref().is_some_and(|o| fills_frame(cx, o)),
+        };
+        let mut echoes: Vec<(Layer, f64)> = Vec::new();
         for k in (1..=count).rev() {
             let te = t - k as f64 * interval;
             let w = decay.powi(k as i32);
             if te < -cx.tl.tol || w < 1.0 / 512.0 {
                 continue;
             }
-            if let Some(mut l) = clip_core(cx, clip, te.max(0.0), t_frame - k as f64 * interval)? {
+            if let Some(l) = clip_core(cx, clip, te.max(0.0), t_frame - k as f64 * interval)? {
+                echoes.push((l, w));
+            }
+        }
+        if blend {
+            // Weighted average of the clip (weight 1) and its echoes (decay^k): ghost trails.
+            let mut acc = out.take();
+            let mut total = if acc.is_some() { 1.0 } else { 0.0 };
+            for (l, w) in echoes.into_iter().rev() {
+                total += w;
+                acc = Some(match acc {
+                    Some(a) => mix_layers(&a, &l, (w / total) as f32),
+                    None => l,
+                });
+            }
+            out = acc;
+        } else {
+            let mut acc: Option<Layer> = None;
+            for (mut l, w) in echoes {
                 l.scale_alpha(w as f32);
                 acc = Some(match acc {
                     Some(a) => over_union(a, &l),
                     None => l,
                 });
             }
-        }
-        if let Some(a) = acc {
-            out = Some(match out {
-                Some(o) => over_union(a, &o),
-                None => a,
-            });
+            if let Some(a) = acc {
+                out = Some(match out {
+                    Some(o) => over_union(a, &o),
+                    None => a,
+                });
+            }
         }
     }
     let Some(mut out) = out else { return Ok(None) };
@@ -909,6 +933,19 @@ fn clip_full(cx: &Ctx, clip: &Clip, span: Span, depth: u32) -> Result<Option<Lay
         apply_matte(cx, &mut out, m, depth)?;
     }
     Ok(Some(out))
+}
+
+/// Whether a layer is opaque over the whole project frame (footage filling it): sampled on a grid
+/// just inside the frame's edges.
+fn fills_frame(cx: &Ctx, l: &Layer) -> bool {
+    let [fx, fy, fw, fh] = cx.frame_rect();
+    (0..5).all(|j| {
+        (0..5).all(|i| {
+            let x = fx + fw * (0.02 + 0.96 * i as f64 / 4.0);
+            let y = fy + fh * (0.02 + 0.96 * j as f64 / 4.0);
+            l.get(x as i32, y as i32)[3] >= 0.98
+        })
+    })
 }
 
 /// Multiplies the clip's pixels by its track matte (rendered at the same timeline time).

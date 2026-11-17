@@ -17,10 +17,63 @@ pub struct ParamSpec {
     pub name: &'static str,
     pub label: &'static str,
     pub default: f64,
+    /// Valid range (`set_effect` / `set_param` refuse values outside it).
     pub min: f64,
     pub max: f64,
     pub unit: &'static str,
     pub help: &'static str,
+    /// The inspector slider's range when only part of `min..max` is useful there (a mask centre can
+    /// go off-frame, but a slider over the frame is what a person drags); typed values may use the
+    /// whole range. `None` = `min..max`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slider: Option<[f64; 2]>,
+    /// How slider travel maps to the value ([`slider_value`]): 1 = linear; 2 or 3 = finer near the
+    /// low end (radii, sizes); 0 = logarithmic (multipliers such as zoom or gamma, positive ranges).
+    #[serde(skip_serializing_if = "is_linear")]
+    pub curve: f64,
+}
+
+fn is_linear(c: &f64) -> bool {
+    *c == 1.0
+}
+
+impl ParamSpec {
+    /// The inspector slider covers only `lo..hi` of the valid range.
+    pub const fn soft(self, lo: f64, hi: f64) -> ParamSpec {
+        ParamSpec { slider: Some([lo, hi]), ..self }
+    }
+    /// Slider travel → value curve (see [`ParamSpec::curve`]).
+    pub const fn curve(self, curve: f64) -> ParamSpec {
+        ParamSpec { curve, ..self }
+    }
+    /// A logarithmic slider (multipliers).
+    pub const fn log(self) -> ParamSpec {
+        ParamSpec { curve: 0.0, ..self }
+    }
+    /// The slider's range (`slider`, else `min..max`).
+    pub fn slider_range(&self) -> [f64; 2] {
+        self.slider.unwrap_or([self.min, self.max])
+    }
+    /// Named values (`"0 = left, 1 = right"` in the help) of a whole-number parameter, shown as a
+    /// drop-down instead of a slider: directions, axes, modes. `None` for continuous parameters.
+    pub fn choices(&self) -> Option<Vec<(f64, String)>> {
+        if !matches!(self.unit, "count" | "") || self.max - self.min > 10.0 {
+            return None;
+        }
+        let mut out: Vec<(f64, String)> = Vec::new();
+        for part in self.help.split([',', ';', ':']) {
+            let part = part.trim().trim_end_matches('.');
+            let Some((num, label)) = part.split_once(" = ") else { continue };
+            let num = num.trim().rsplit(' ').next().unwrap_or("");
+            // A label ends with its sentence ("2 = blend. Auto draws …").
+            let label = label.split(". ").next().unwrap_or(label);
+            let (Ok(v), label) = (num.parse::<f64>(), label.trim()) else { continue };
+            if v.fract() == 0.0 && v >= self.min && v <= self.max && !label.is_empty() && !out.iter().any(|(x, _)| *x == v) {
+                out.push((v, label.to_string()));
+            }
+        }
+        (out.len() >= 2).then_some(out)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -58,14 +111,14 @@ const fn p(
     unit: &'static str,
     help: &'static str,
 ) -> ParamSpec {
-    ParamSpec { name, label, default, min, max, unit, help }
+    ParamSpec { name, label, default, min, max, unit, help, slider: None, curve: 1.0 }
 }
 
-const MASK_X: ParamSpec = p("x", "Center X", 0.5, -1.0, 2.0, "frac", "Horizontal centre of the mask as a fraction of the frame width (0 = left edge).");
-const MASK_Y: ParamSpec = p("y", "Center Y", 0.5, -1.0, 2.0, "frac", "Vertical centre of the mask as a fraction of the frame height (0 = top edge).");
-const MASK_W: ParamSpec = p("width", "Width", 0.5, 0.0, 3.0, "frac", "Mask width as a fraction of the frame width.");
-const MASK_H: ParamSpec = p("height", "Height", 0.5, 0.0, 3.0, "frac", "Mask height as a fraction of the frame height.");
-const MASK_FEATHER: ParamSpec = p("feather", "Feather", 0.0, 0.0, 500.0, "px", "Soft edge width in pixels.");
+const MASK_X: ParamSpec = p("x", "Center X", 0.5, -1.0, 2.0, "frac", "Horizontal centre of the mask as a fraction of the frame width (0 = left edge).").soft(0.0, 1.0);
+const MASK_Y: ParamSpec = p("y", "Center Y", 0.5, -1.0, 2.0, "frac", "Vertical centre of the mask as a fraction of the frame height (0 = top edge).").soft(0.0, 1.0);
+const MASK_W: ParamSpec = p("width", "Width", 0.5, 0.0, 3.0, "frac", "Mask width as a fraction of the frame width.").soft(0.0, 1.5);
+const MASK_H: ParamSpec = p("height", "Height", 0.5, 0.0, 3.0, "frac", "Mask height as a fraction of the frame height.").soft(0.0, 1.5);
+const MASK_FEATHER: ParamSpec = p("feather", "Feather", 0.0, 0.0, 500.0, "px", "Soft edge width in pixels.").soft(0.0, 300.0).curve(2.0);
 const MASK_INVERT: ParamSpec = p("invert", "Invert", 0.0, 0.0, 1.0, "toggle", "1 keeps the outside of the shape instead of the inside.");
 
 pub static EFFECTS: &[EffectSpec] = &[
@@ -81,7 +134,7 @@ pub static EFFECTS: &[EffectSpec] = &[
             p("temperature", "Temperature", 0.0, -1.0, 1.0, "", "White balance: negative = cooler/bluer, positive = warmer/more orange."),
             p("tint", "Tint", 0.0, -1.0, 1.0, "", "White balance: negative = greener, positive = more magenta."),
             p("brightness", "Brightness", 0.0, -1.0, 1.0, "", "Adds (+) or subtracts (−) a flat amount of light to every pixel."),
-            p("gamma", "Gamma", 1.0, 0.1, 5.0, "", "Mid-tone curve: above 1 brightens mid-tones, below 1 darkens them."),
+            p("gamma", "Gamma", 1.0, 0.1, 5.0, "", "Mid-tone curve: above 1 brightens mid-tones, below 1 darkens them.").log(),
             p("highlights", "Highlights", 0.0, -1.0, 1.0, "", "Recovers (−) or boosts (+) the brightest areas only."),
             p("shadows", "Shadows", 0.0, -1.0, 1.0, "", "Lifts (+) or crushes (−) the darkest areas only."),
             p("hue", "Hue shift", 0.0, -180.0, 180.0, "deg", "Rotates every hue around the colour wheel."),
@@ -94,7 +147,7 @@ pub static EFFECTS: &[EffectSpec] = &[
         kind: "blur",
         label: "Gaussian blur",
         category: "blur",
-        params: &[p("radius", "Radius", 10.0, 0.0, 200.0, "px", "Gaussian standard deviation (σ) in project px, like CSS blur(); 0 = sharp.")],
+        params: &[p("radius", "Radius", 10.0, 0.0, 200.0, "px", "Gaussian standard deviation (σ) in project px, like CSS blur(); 0 = sharp.").soft(0.0, 100.0).curve(2.0)],
         colors: &[],
         strings: &[],
         help: "Gaussian blur of the clip (radius = σ, CSS blur() semantics); animate the radius for a focus pull.",
@@ -129,8 +182,8 @@ pub static EFFECTS: &[EffectSpec] = &[
         label: "Chroma key",
         category: "keying",
         params: &[
-            p("tolerance", "Tolerance", 0.3, 0.0, 1.0, "", "BT.601 CbCr distance from the key colour within which pixels become fully transparent (pure green is about 0.54 from grey)."),
-            p("softness", "Softness", 0.1, 0.0, 1.0, "", "Extra CbCr distance beyond the tolerance over which pixels fade from transparent to opaque."),
+            p("tolerance", "Tolerance", 0.3, 0.0, 1.0, "", "BT.601 CbCr distance from the key colour within which pixels become fully transparent (pure green is about 0.54 from grey).").soft(0.0, 0.6),
+            p("softness", "Softness", 0.1, 0.0, 1.0, "", "Extra CbCr distance beyond the tolerance over which pixels fade from transparent to opaque.").soft(0.0, 0.5),
             p("spill", "Spill suppression", 0.5, 0.0, 1.0, "frac", "Removes the key colour's tint reflected onto the subject."),
         ],
         colors: &[("key", "#00FF00")],
@@ -147,7 +200,7 @@ pub static EFFECTS: &[EffectSpec] = &[
             MASK_W,
             MASK_H,
             MASK_FEATHER,
-            p("radius", "Corner radius", 0.0, 0.0, 2000.0, "px", "Rounds the rectangle's corners."),
+            p("radius", "Corner radius", 0.0, 0.0, 2000.0, "px", "Rounds the rectangle's corners.").soft(0.0, 540.0).curve(1.5),
             MASK_INVERT,
         ],
         colors: &[],
@@ -168,9 +221,9 @@ pub static EFFECTS: &[EffectSpec] = &[
         label: "Drop shadow",
         category: "light",
         params: &[
-            p("distance", "Distance", 12.0, 0.0, 500.0, "px", "How far the shadow is offset from the content."),
-            p("angle", "Angle", 45.0, -360.0, 360.0, "deg", "Direction the shadow falls: 0 = right, 90 = down."),
-            p("blur", "Blur", 16.0, 0.0, 200.0, "px", "Soft edge width in px (2σ of the Gaussian); 0 = hard shadow."),
+            p("distance", "Distance", 12.0, 0.0, 500.0, "px", "How far the shadow is offset from the content.").soft(0.0, 200.0).curve(2.0),
+            p("angle", "Angle", 45.0, -360.0, 360.0, "deg", "Direction the shadow falls: 0 = right, 90 = down.").soft(-180.0, 180.0),
+            p("blur", "Blur", 16.0, 0.0, 200.0, "px", "Soft edge width in px (2σ of the Gaussian); 0 = hard shadow.").soft(0.0, 100.0).curve(2.0),
             p("opacity", "Opacity", 0.6, 0.0, 1.0, "frac", "Shadow strength."),
         ],
         colors: &[("color", "#000000")],
@@ -182,7 +235,7 @@ pub static EFFECTS: &[EffectSpec] = &[
         label: "Glow",
         category: "light",
         params: &[
-            p("radius", "Radius", 24.0, 0.0, 300.0, "px", "How far the glow spreads: soft edge width in px (2σ of the Gaussian)."),
+            p("radius", "Radius", 24.0, 0.0, 300.0, "px", "How far the glow spreads: soft edge width in px (2σ of the Gaussian).").soft(0.0, 150.0).curve(2.0),
             p("intensity", "Intensity", 1.0, 0.0, 5.0, "x", "Brightness of the glow."),
             p("threshold", "Threshold", 0.6, 0.0, 1.0, "frac", "Only pixels brighter than this glow (0 = everything)."),
         ],
@@ -194,7 +247,7 @@ pub static EFFECTS: &[EffectSpec] = &[
         kind: "pixelate",
         label: "Pixelate",
         category: "stylize",
-        params: &[p("size", "Block size", 16.0, 1.0, 512.0, "px", "Size of each square block.")],
+        params: &[p("size", "Block size", 16.0, 1.0, 512.0, "px", "Size of each square block.").soft(1.0, 256.0).curve(2.0)],
         colors: &[],
         strings: &[],
         help: "Mosaic of square blocks (combine with a mask to censor part of the frame).",
@@ -205,7 +258,7 @@ pub static EFFECTS: &[EffectSpec] = &[
         category: "stylize",
         params: &[
             p("amount", "Amount", 0.15, 0.0, 1.0, "frac", "Grain strength."),
-            p("size", "Size", 1.0, 0.5, 8.0, "px", "Grain particle size."),
+            p("size", "Size", 1.0, 1.0, 8.0, "px", "Grain particle size in project px (1 = per pixel, the finest grain)."),
             p("chroma", "Colour grain", 0.0, 0.0, 1.0, "toggle", "1 = coloured grain, 0 = monochrome."),
             p("seed", "Seed", 0.0, 0.0, 1_000_000.0, "count", "Changes the pattern; the same seed always renders the same grain (deterministic)."),
         ],
@@ -249,7 +302,7 @@ pub static EFFECTS: &[EffectSpec] = &[
         kind: "posterize",
         label: "Posterize",
         category: "stylize",
-        params: &[p("levels", "Levels", 6.0, 2.0, 64.0, "count", "Number of tone levels per colour channel.")],
+        params: &[p("levels", "Levels", 6.0, 2.0, 64.0, "count", "Number of tone levels per colour channel.").soft(2.0, 32.0).curve(1.5)],
         colors: &[],
         strings: &[],
         help: "Reduces the number of tones for a flat, graphic look.",
@@ -281,8 +334,8 @@ pub static EFFECTS: &[EffectSpec] = &[
         label: "RGB split",
         category: "distort",
         params: &[
-            p("amount", "Amount", 6.0, 0.0, 100.0, "px", "Distance between the red and blue channels."),
-            p("angle", "Angle", 0.0, -360.0, 360.0, "deg", "Direction of the split: 0 = horizontal."),
+            p("amount", "Amount", 6.0, 0.0, 100.0, "px", "Distance between the red and blue channels.").soft(0.0, 50.0).curve(1.5),
+            p("angle", "Angle", 0.0, -360.0, 360.0, "deg", "Direction of the split: 0 = horizontal.").soft(-180.0, 180.0),
         ],
         colors: &[],
         strings: &[],
@@ -293,8 +346,8 @@ pub static EFFECTS: &[EffectSpec] = &[
         label: "Camera shake",
         category: "motion",
         params: &[
-            p("amount", "Amount", 12.0, 0.0, 200.0, "px", "Maximum displacement."),
-            p("frequency", "Frequency", 8.0, 0.1, 60.0, "hz", "Shakes per second."),
+            p("amount", "Amount", 12.0, 0.0, 200.0, "px", "Maximum displacement.").soft(0.0, 100.0).curve(2.0),
+            p("frequency", "Frequency", 8.0, 0.1, 60.0, "hz", "Shakes per second.").soft(0.5, 30.0).log(),
             p("rotation", "Rotation", 0.0, 0.0, 20.0, "deg", "Maximum rotational shake."),
             p("seed", "Seed", 0.0, 0.0, 1_000_000.0, "count", "Changes the (deterministic) shake pattern."),
         ],
@@ -307,8 +360,8 @@ pub static EFFECTS: &[EffectSpec] = &[
         label: "Directional blur",
         category: "blur",
         params: &[
-            p("angle", "Angle", 0.0, -360.0, 360.0, "deg", "Direction of the blur: 0 = horizontal, 90 = vertical."),
-            p("length", "Length", 20.0, 0.0, 500.0, "px", "Length of the smear along that direction."),
+            p("angle", "Angle", 0.0, -360.0, 360.0, "deg", "Direction of the blur: 0 = horizontal, 90 = vertical (it smears both ways, so 180 = 0).").soft(-90.0, 90.0),
+            p("length", "Length", 20.0, 0.0, 500.0, "px", "Length of the smear along that direction.").soft(0.0, 300.0).curve(2.0),
         ],
         colors: &[],
         strings: &[],
@@ -334,19 +387,28 @@ pub static EFFECTS: &[EffectSpec] = &[
         category: "motion",
         params: &[
             p("count", "Echoes", 3.0, 1.0, 12.0, "count", "Number of trailing copies."),
-            p("interval", "Interval", 0.05, 0.001, 5.0, "s", "Time between echoes: echo k shows the clip at t - k × interval."),
+            p("interval", "Interval", 0.05, 0.001, 5.0, "s", "Time between echoes: echo k shows the clip at t - k × interval.").soft(0.01, 1.0).log(),
             p("decay", "Decay", 0.5, 0.0, 1.0, "frac", "Opacity of each echo relative to the previous one."),
+            p(
+                "mode",
+                "Mode",
+                0.0,
+                0.0,
+                2.0,
+                "count",
+                "How echoes combine with the clip: 0 = auto, 1 = behind, 2 = blend. Auto draws them behind cut-outs, text and picture-in-picture, and blends them over footage that fills the frame (where behind would hide them).",
+            ),
         ],
         colors: &[],
         strings: &[],
-        help: "Time trails: draws the clip as it was k × interval earlier, under itself, with decaying opacity.",
+        help: "Time trails: the clip as it was k × interval earlier, at decaying opacity, behind it (cut-outs, text) or blended over it (full-frame footage).",
     },
     EffectSpec {
         kind: "stutter",
         label: "Stutter",
         category: "motion",
         params: &[
-            p("rate", "Rate", 8.0, 0.1, 60.0, "hz", "Steps per second."),
+            p("rate", "Rate", 8.0, 0.1, 60.0, "hz", "Steps per second.").soft(1.0, 30.0).log(),
             p("hold", "Hold", 0.5, 0.0, 1.0, "frac", "Part of each step frozen on the step's first frame (1 = pure frame repeat, 0 = off)."),
         ],
         colors: &[],
@@ -358,9 +420,9 @@ pub static EFFECTS: &[EffectSpec] = &[
         label: "Edge glow",
         category: "light",
         params: &[
-            p("threshold", "Threshold", 0.2, 0.0, 1.0, "frac", "Edge strength needed to glow (lower = more edges)."),
-            p("radius", "Radius", 8.0, 0.0, 200.0, "px", "Size of the glow around edges."),
-            p("intensity", "Intensity", 1.5, 0.0, 10.0, "x", "Brightness of the glow."),
+            p("threshold", "Threshold", 0.2, 0.0, 1.0, "frac", "Edge strength needed to glow (lower = more edges).").soft(0.0, 0.6),
+            p("radius", "Radius", 8.0, 0.0, 200.0, "px", "Size of the glow around edges.").soft(0.0, 100.0).curve(2.0),
+            p("intensity", "Intensity", 1.5, 0.0, 10.0, "x", "Brightness of the glow.").soft(0.0, 5.0),
         ],
         colors: &[("color", "#00E5FF")],
         strings: &[],
@@ -379,7 +441,7 @@ pub static EFFECTS: &[EffectSpec] = &[
         kind: "exposure_flash",
         label: "Exposure flash",
         category: "light",
-        params: &[p("amount", "Amount", 0.5, 0.0, 4.0, "x", "White light added (keyframe 0 → 1 → 0 for a flash on a beat).")],
+        params: &[p("amount", "Amount", 0.5, 0.0, 4.0, "x", "White light added (keyframe 0 → 1 → 0 for a flash on a beat); 1 turns the picture white.").soft(0.0, 1.0)],
         colors: &[],
         strings: &[],
         help: "Additive brightness pulse; keyframe it to flash on beats.",
@@ -388,7 +450,7 @@ pub static EFFECTS: &[EffectSpec] = &[
 
 const WIPE_SOFT: ParamSpec = p("softness", "Edge softness", 0.05, 0.0, 1.0, "frac", "Width of the soft wipe edge as a fraction of the frame.");
 const DIP_HOLD: ParamSpec = p("hold", "Hold", 0.1, 0.0, 0.9, "frac", "Fraction of the transition spent fully on the dip colour.");
-const ZOOM_AMOUNT: ParamSpec = p("amount", "Zoom", 1.5, 1.0, 10.0, "x", "Scale reached at the cut.");
+const ZOOM_AMOUNT: ParamSpec = p("amount", "Zoom", 1.5, 1.0, 10.0, "x", "Scale reached at the cut.").log();
 
 pub static TRANSITIONS: &[TransitionSpec] = &[
     TransitionSpec { kind: "crossfade", label: "Cross dissolve", params: &[], help: "The outgoing picture fades into the incoming one; sound crossfades.", default_duration: 0.5, colors: &[] },
@@ -437,7 +499,7 @@ pub static TRANSITIONS: &[TransitionSpec] = &[
     TransitionSpec {
         kind: "blur_dissolve",
         label: "Blur dissolve",
-        params: &[p("radius", "Blur radius", 30.0, 0.0, 200.0, "px", "Peak blur at the middle of the transition.")],
+        params: &[p("radius", "Blur radius", 30.0, 0.0, 200.0, "px", "Peak blur at the middle of the transition.").soft(0.0, 100.0).curve(2.0)],
         help: "Blurs out of the outgoing clip and into the incoming one while dissolving.",
         default_duration: 0.5,
         colors: &[],
@@ -447,7 +509,7 @@ pub static TRANSITIONS: &[TransitionSpec] = &[
         label: "Whip pan",
         params: &[
             p("blur", "Motion blur", 0.8, 0.0, 1.0, "frac", "Strength of the directional motion blur."),
-            p("angle", "Direction", 0.0, -360.0, 360.0, "deg", "Direction the picture travels: 0 = to the left (new clip enters from the right)."),
+            p("angle", "Direction", 0.0, -360.0, 360.0, "deg", "Direction the picture travels: 0 = to the left (new clip enters from the right).").soft(-180.0, 180.0),
         ],
         help: "Fast motion-blurred push, like a whip pan between shots.",
         default_duration: 0.3,
@@ -469,7 +531,7 @@ pub static TRANSITIONS: &[TransitionSpec] = &[
         kind: "zoom_through",
         label: "Zoom through",
         params: &[
-            p("amount", "Zoom", 3.0, 1.0, 20.0, "x", "Scale the outgoing clip punches into, and the incoming one zooms out from."),
+            p("amount", "Zoom", 3.0, 1.0, 20.0, "x", "Scale the outgoing clip punches into, and the incoming one zooms out from.").log(),
             p("blur", "Zoom blur", 0.6, 0.0, 1.0, "frac", "Strength of the radial (zoom) blur at the cut."),
         ],
         help: "Punches through the outgoing clip with a radial blur and lands on the incoming one zooming out.",
@@ -480,8 +542,8 @@ pub static TRANSITIONS: &[TransitionSpec] = &[
         kind: "shake",
         label: "Shake",
         params: &[
-            p("amount", "Amount", 40.0, 0.0, 500.0, "px", "Peak displacement at the cut."),
-            p("angle", "Angle", 0.0, -360.0, 360.0, "deg", "Direction of the shake: 0 = horizontal, 90 = vertical."),
+            p("amount", "Amount", 40.0, 0.0, 500.0, "px", "Peak displacement at the cut.").soft(0.0, 200.0).curve(2.0),
+            p("angle", "Angle", 0.0, -360.0, 360.0, "deg", "Direction of the shake: 0 = horizontal, 90 = vertical.").soft(-180.0, 180.0),
             p("blur", "Motion blur", 0.5, 0.0, 1.0, "frac", "Directional blur along the shake."),
         ],
         help: "A hard camera shake that peaks at the cut, with directional motion blur.",
@@ -502,7 +564,7 @@ pub static TRANSITIONS: &[TransitionSpec] = &[
     TransitionSpec {
         kind: "flash_zoom",
         label: "Flash zoom",
-        params: &[p("amount", "Zoom", 1.3, 1.0, 5.0, "x", "Zoom punch at the cut.")],
+        params: &[p("amount", "Zoom", 1.3, 1.0, 5.0, "x", "Zoom punch at the cut.").log()],
         help: "A white flash at the cut with a zoom punch into the incoming clip.",
         default_duration: 0.4,
         colors: &[],
@@ -674,8 +736,35 @@ pub fn transition_color(t: &Transition, name: &str) -> Color {
     transition_spec(&t.kind).and_then(|s| s.color_default(name)).unwrap_or(Color::WHITE)
 }
 
+/// The value at position `f` (0 = left end, 1 = right end) of a parameter's inspector slider:
+/// its slider range mapped through its curve.
+pub fn slider_value(p: &ParamSpec, f: f64) -> f64 {
+    let [lo, hi] = p.slider_range();
+    let f = if f.is_finite() { f.clamp(0.0, 1.0) } else { 0.0 };
+    if p.curve == 0.0 && lo > 0.0 && hi > lo {
+        lo * (hi / lo).powf(f)
+    } else {
+        lo + (hi - lo) * f.powf(if p.curve > 0.0 { p.curve } else { 1.0 })
+    }
+}
+
+/// Where value `v` sits on a parameter's inspector slider (0..1, clamped to the slider's ends);
+/// the inverse of [`slider_value`].
+pub fn slider_pos(p: &ParamSpec, v: f64) -> f64 {
+    let [lo, hi] = p.slider_range();
+    if !(hi > lo) || !v.is_finite() {
+        return 0.0;
+    }
+    let v = v.clamp(lo, hi);
+    if p.curve == 0.0 && lo > 0.0 {
+        ((v / lo).ln() / (hi / lo).ln()).clamp(0.0, 1.0)
+    } else {
+        ((v - lo) / (hi - lo)).clamp(0.0, 1.0).powf(1.0 / if p.curve > 0.0 { p.curve } else { 1.0 })
+    }
+}
+
 /// Every effect kind name.
-pub fn effect_kinds() -> impl Iterator<Item = &'static str> {
+pub fn effect_kinds()-> impl Iterator<Item = &'static str> {
     EFFECTS.iter().map(|e| e.kind)
 }
 
@@ -754,6 +843,43 @@ mod tests {
         let dv = |n: &str| DUCKING_PARAMS.iter().find(|p| p.name == n).unwrap().default;
         assert_eq!((d.amount_db, d.threshold_db, d.attack, d.release), (dv("amount_db"), dv("threshold_db"), dv("attack"), dv("release")));
         assert!(DUCKING_PARAMS.iter().find(|p| p.name == "release").unwrap().help.contains("0.3 s"));
+    }
+
+    #[test]
+    fn sliders_cover_the_useful_range_and_round_trip() {
+        let all = EFFECTS.iter().flat_map(|e| e.params.iter().map(move |p| (e.kind, p))).chain(TRANSITIONS.iter().flat_map(|t| t.params.iter().map(move |p| (t.kind, p))));
+        for (kind, p) in all {
+            let [lo, hi] = p.slider_range();
+            assert!(p.min <= lo && lo < hi && hi <= p.max, "{kind}.{}: slider {lo}–{hi} inside {}–{}", p.name, p.min, p.max);
+            assert!(p.curve == 0.0 || p.curve >= 1.0, "{kind}.{}", p.name);
+            if p.curve == 0.0 {
+                assert!(lo > 0.0, "{kind}.{}: a logarithmic slider needs a positive range", p.name);
+            }
+            // The ends are the slider's range; positions round-trip.
+            assert!((slider_value(p, 0.0) - lo).abs() < 1e-9 && (slider_value(p, 1.0) - hi).abs() < 1e-6 * hi.abs().max(1.0), "{kind}.{}", p.name);
+            for k in 0..=10 {
+                let f = k as f64 / 10.0;
+                assert!((slider_pos(p, slider_value(p, f)) - f).abs() < 1e-6, "{kind}.{} at {f}", p.name);
+            }
+            // The default sits on the slider (it is where a reset puts the knob).
+            assert!(p.default >= lo && p.default <= hi, "{kind}.{}: default {} off the slider {lo}–{hi}", p.name, p.default);
+        }
+        // Wide pixel ranges give the low end most of the travel; multipliers are logarithmic.
+        let blur = effect_spec("blur").unwrap().param("radius").unwrap();
+        assert!(slider_value(blur, 0.5) <= 30.0, "half a blur slider is a moderate blur");
+        let zoom = transition_spec("zoom_in").unwrap().param("amount").unwrap();
+        assert!((slider_value(zoom, 0.5) - 10f64.sqrt()).abs() < 1e-9);
+        // Named values come from the help.
+        let dir = transition_spec("spin").unwrap().param("direction").unwrap();
+        assert_eq!(dir.choices().unwrap().iter().map(|(v, _)| *v).collect::<Vec<_>>(), vec![1.0, -1.0]);
+        let mode = effect_spec("echo").unwrap().param("mode").unwrap().choices().unwrap();
+        assert_eq!(mode.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>(), vec!["auto", "behind", "blend"]);
+        assert!(effect_spec("drop_shadow").unwrap().param("angle").unwrap().choices().is_none());
+        // The registry JSON (list_effects) carries the slider hints only where they differ.
+        let j = serde_json::to_value(effect_spec("blur").unwrap()).unwrap();
+        assert_eq!(j["params"][0]["slider"], serde_json::json!([0.0, 100.0]));
+        assert_eq!(j["params"][0]["curve"], serde_json::json!(2.0));
+        assert!(serde_json::to_value(effect_spec("invert").unwrap()).unwrap()["params"][0].get("slider").is_none());
     }
 
     #[test]

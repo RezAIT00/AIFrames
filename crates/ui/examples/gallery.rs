@@ -497,6 +497,8 @@ impl Gallery {
                 UiAction::AskAi { prompt, ids } => self.status = format!("AI prompt pre-filled: “{prompt}” ({})", ids.join(", ")),
                 UiAction::RevealMedia(id) => self.status = format!("Reveal {id} in Explorer (app shell)."),
                 UiAction::RelinkMedia(id) => self.status = format!("Relink {id}: file dialog (app shell)."),
+                UiAction::Preview(_) => {}
+                UiAction::PickEffectFile { clip, index, name } => self.status = format!("Pick a file for {name} of effect {index} on {clip} (app shell)."),
             }
         }
     }
