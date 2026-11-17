@@ -1,0 +1,443 @@
+//! (Added) Pictures for the effects browser ([`FxPreview`]) and its live hover preview in the viewer.
+//!
+//! * **Thumbnails** show what a click would make ([`preview_plan`]) on the selected picture clip at the
+//!   playhead, or on a sample scene when no picture clip is selected (or, for transitions, when the
+//!   selected clip has no cut). They are rendered by the one renderer on a scratch copy of the project
+//!   ([`aiframes_mcp::fx_preview`]); the document is never touched, so nothing enters the history.
+//! * **Never in the way of playback or the UI.** One background thread renders, inside its own small
+//!   rayon pool whose threads run at the lowest OS priority (the renderer's inner loops would otherwise
+//!   share the global pool with the playback workers). While the viewer plays it pauses between
+//!   thumbnails. The UI thread only looks up textures.
+//! * **Debounced base.** Thumbnails follow the document revision, the selection and the playhead once
+//!   they have been still for a moment (not while playing or scrubbing); old pictures stay up until
+//!   their replacements are ready, so nothing flickers. Only items the browser draws are rendered.
+//! * **Hover previews** ([`HoverCtl`]): after a short dwell the hovered item's ops go to the app's
+//!   transient op preview (the program viewer shows a scratch copy; nothing enters the history).
+
+use crate::playback::Snapshot;
+use aiframes_core::Id;
+use aiframes_mcp::fx_preview::{self as fxp, Scratch};
+use aiframes_render::Renderer;
+use aiframes_ui::effects_browser::{anim_time, preview_plan, BrowserDrag, FxPreview, PreviewPlan, ANIM_FRAMES, PRESET_SETTLE};
+use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+/// Thumbnail width in pixels (tiles are about 100–150 points wide; this stays sharp at 150–200 % scaling).
+pub const THUMB_W: u32 = 256;
+/// How long the playhead/selection must rest before thumbnails follow it.
+const SETTLE: f64 = 0.35;
+/// Pause between thumbnails while the viewer plays.
+const PLAYING_GAP: Duration = Duration::from_millis(60);
+/// Threads of the thumbnail render pool.
+const POOL_THREADS: usize = 2;
+/// Most queued thumbnail requests.
+const MAX_QUEUE: usize = 512;
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Runs the calling thread at the lowest priority (Windows); elsewhere a no-op.
+#[cfg(windows)]
+fn lowest_priority() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThread() -> *mut std::ffi::c_void;
+        fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
+    }
+    const THREAD_PRIORITY_LOWEST: i32 = -2;
+    // SAFETY: documented Win32 calls on the current thread's pseudo-handle; failure is harmless.
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    }
+}
+
+#[cfg(not(windows))]
+fn lowest_priority() {}
+
+/// What the thumbnails are rendered from.
+struct Base {
+    id: u64,
+    /// The document as last saved into a snapshot (project, resolved spans, folder).
+    doc: Arc<Snapshot>,
+    selection: Vec<Id>,
+    playhead: f64,
+    /// True when a picture clip is selected (thumbnails show it); else the sample scene.
+    on_clip: bool,
+}
+
+impl Base {
+    fn key(&self) -> BaseKey {
+        BaseKey::new(&self.doc, &self.selection, self.playhead, self.on_clip)
+    }
+}
+
+/// The sample scene for one frame size.
+struct Sample {
+    size: (u32, u32, u64),
+    scratch: Arc<Scratch>,
+    dir: PathBuf,
+}
+
+#[derive(Clone, PartialEq)]
+struct BaseKey {
+    doc: (u64, u64, u64),
+    selection: Vec<Id>,
+    /// The playhead's frame (only when a clip is selected: the sample does not depend on it).
+    frame: Option<i64>,
+}
+
+impl BaseKey {
+    fn new(doc: &Snapshot, selection: &[Id], playhead: f64, on_clip: bool) -> BaseKey {
+        BaseKey {
+            doc: doc.key(),
+            selection: if on_clip { selection.to_vec() } else { Vec::new() },
+            frame: on_clip.then(|| crate::timecode::frame_index(playhead, doc.fps())),
+        }
+    }
+}
+
+type ThumbKey = (BrowserDrag, u32);
+
+struct Tex {
+    tex: TextureHandle,
+    base: u64,
+}
+
+#[derive(Default)]
+struct State {
+    base: Option<Arc<Base>>,
+    next_base: u64,
+    thumbs: HashMap<ThumbKey, Tex>,
+    queue: VecDeque<ThumbKey>,
+    pending: HashSet<ThumbKey>,
+    playing: bool,
+    stop: bool,
+    /// Thumbnails rendered, their total render ms, and failures (perf log).
+    rendered: u64,
+    render_ms: f64,
+    failed: u64,
+    last_error: Option<String>,
+}
+
+struct Inner {
+    renderer: Arc<Renderer>,
+    ctx: egui::Context,
+    st: Mutex<State>,
+    cv: Condvar,
+    sample: Mutex<Option<Arc<Sample>>>,
+}
+
+pub struct FxPreviews {
+    inner: Arc<Inner>,
+    /// The base the app asked for and since when it has been the same (debounce).
+    wanted: Option<(BaseKey, f64)>,
+}
+
+impl FxPreviews {
+    pub fn new(ctx: egui::Context, renderer: Arc<Renderer>) -> FxPreviews {
+        let inner = Arc::new(Inner { renderer, ctx, st: Mutex::new(State::default()), cv: Condvar::new(), sample: Mutex::new(None) });
+        let i = inner.clone();
+        let _ = std::thread::Builder::new().name("aiframes-fx-thumbs".into()).spawn(move || worker(i));
+        FxPreviews { inner, wanted: None }
+    }
+
+    /// Per UI frame while the effects browser is visible: what the thumbnails should show. `doc` is
+    /// the document's snapshot (not a live preview); `playing`/`scrubbing` hold the base still.
+    pub fn set_base(&mut self, doc: &Arc<Snapshot>, selection: &[Id], playhead: f64, playing: bool, scrubbing: bool, now: f64) {
+        let on_clip = preview_plan(&BrowserDrag::Effect("color".into()), &doc.project, &doc.resolved, selection, playhead).is_some();
+        let key = BaseKey::new(doc, selection, playhead, on_clip);
+        if self.wanted.as_ref().map(|(k, _)| k) != Some(&key) {
+            self.wanted = Some((key.clone(), now));
+        }
+        let since = self.wanted.as_ref().map(|(_, t)| *t).unwrap_or(now);
+        let mut st = lock(&self.inner.st);
+        st.playing = playing;
+        if st.base.as_ref().map(|b| b.key()).as_ref() == Some(&key) {
+            return;
+        }
+        // The first base at once; later ones once things rest (never while playing or scrubbing: the
+        // pictures would chase the playhead).
+        let settled = !playing && !scrubbing && now - since >= SETTLE;
+        if st.base.is_some() && !settled {
+            if !playing && !scrubbing {
+                self.inner.ctx.request_repaint_after(Duration::from_secs_f64(SETTLE));
+            }
+            return;
+        }
+        st.next_base += 1;
+        let id = st.next_base;
+        st.base = Some(Arc::new(Base { id, doc: doc.clone(), selection: selection.to_vec(), playhead, on_clip }));
+        // Requests for the old base are moot; the browser asks again for what it shows.
+        st.queue.clear();
+        st.pending.clear();
+        drop(st);
+        self.inner.cv.notify_all();
+    }
+
+    /// (thumbnails rendered, average ms, queued, failed) for the perf log.
+    pub fn stats(&self) -> (u64, f64, usize, u64) {
+        let st = lock(&self.inner.st);
+        (st.rendered, if st.rendered > 0 { st.render_ms / st.rendered as f64 } else { 0.0 }, st.queue.len(), st.failed)
+    }
+}
+
+impl Drop for FxPreviews {
+    fn drop(&mut self) {
+        lock(&self.inner.st).stop = true;
+        self.inner.cv.notify_all();
+    }
+}
+
+impl FxPreview for FxPreviews {
+    fn thumb(&self, item: &BrowserDrag, frame: u32) -> Option<egui::TextureId> {
+        let frame = frame.min(ANIM_FRAMES);
+        let mut st = lock(&self.inner.st);
+        let base = st.base.as_ref()?.id;
+        let key = (item.clone(), frame);
+        let (have, stale) = match st.thumbs.get(&key) {
+            Some(t) => (Some(t.tex.id()), t.base != base),
+            None => (None, true),
+        };
+        if stale && !st.pending.contains(&key) && st.queue.len() < MAX_QUEUE {
+            st.pending.insert(key.clone());
+            // Animation frames are wanted now (the item is hovered); stills in reading order.
+            if frame > 0 {
+                st.queue.push_front(key);
+            } else {
+                st.queue.push_back(key);
+            }
+            drop(st);
+            self.inner.cv.notify_one();
+        }
+        have
+    }
+
+    fn source(&self) -> Option<String> {
+        let st = lock(&self.inner.st);
+        let b = st.base.as_ref()?;
+        if !b.on_clip {
+            return Some("a sample picture — select a clip to preview on it".into());
+        }
+        let names: Vec<&str> = b.doc.project.clips.iter().filter(|c| b.selection.contains(&c.id)).map(|c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() }).take(2).collect();
+        let more = if b.selection.len() > 2 { " …" } else { "" };
+        Some(format!("{}{more} at {}", names.join(", "), aiframes_ui::util::timecode(b.playhead, b.doc.fps())))
+    }
+}
+
+impl Inner {
+    /// The sample scene for the document's frame size (its pictures are written to the cache once).
+    fn sample(&self, doc: &Snapshot) -> Result<Arc<Sample>, String> {
+        let s = &doc.project.settings;
+        let size = (s.width, s.height, (s.fps * 1000.0).round() as u64);
+        if let Some(x) = lock(&self.sample).as_ref().filter(|x| x.size == size) {
+            return Ok(x.clone());
+        }
+        let cache = self.renderer.pool().cache_dir().to_path_buf();
+        let p = fxp::sample_project(&cache, s.width, s.height, s.fps)?;
+        let x = Arc::new(Sample { size, scratch: Arc::new(fxp::scratch(&p, &[])?), dir: cache });
+        *lock(&self.sample) = Some(x.clone());
+        Ok(x)
+    }
+
+    /// The picture of `item` (animation `frame`) on `base`: on the document when a click there would
+    /// do something, else on the sample scene.
+    fn render_thumb(&self, base: &Base, item: &BrowserDrag, frame: u32) -> Result<ColorImage, String> {
+        let on_doc = if base.on_clip { preview_plan(item, &base.doc.project, &base.doc.resolved, &base.selection, base.playhead) } else { None };
+        let img = match on_doc {
+            Some(plan) => fxp::render(&self.renderer, &base.doc.dir, &fxp::scratch(&base.doc.project, &plan.ops)?, at_of(&plan, frame), THUMB_W)?,
+            None => {
+                let s = self.sample(&base.doc)?;
+                let sel = vec![fxp::SAMPLE_A.to_string()];
+                let plan = preview_plan(item, &s.scratch.project, &s.scratch.resolved, &sel, fxp::SAMPLE_AT).ok_or_else(|| format!("{} cannot be shown on the sample", item.label()))?;
+                fxp::render(&self.renderer, &s.dir, &fxp::scratch(&s.scratch.project, &plan.ops)?, at_of(&plan, frame), THUMB_W)?
+            }
+        };
+        Ok(ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.rgba))
+    }
+}
+
+/// When to render: the plan's moment, or a frame of a transition's animation.
+fn at_of(plan: &PreviewPlan, frame: u32) -> f64 {
+    match (frame, plan.span) {
+        (1.., Some(span)) => anim_time(span, frame),
+        _ => plan.at,
+    }
+}
+
+fn worker(inner: Arc<Inner>) {
+    lowest_priority();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(POOL_THREADS).thread_name(|n| format!("aiframes-fx-render-{n}")).start_handler(|_| lowest_priority()).build().ok();
+    loop {
+        let (base, key, playing) = {
+            let mut st = lock(&inner.st);
+            loop {
+                if st.stop {
+                    return;
+                }
+                if let (Some(base), Some(k)) = (st.base.clone(), st.queue.pop_front()) {
+                    break (base, k, st.playing);
+                }
+                st = inner.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        let t0 = Instant::now();
+        let job = || inner.render_thumb(&base, &key.0, key.1);
+        let result = match &pool {
+            Some(p) => p.install(job),
+            None => job(),
+        };
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let mut st = lock(&inner.st);
+        st.pending.remove(&key);
+        match result {
+            Ok(img) => {
+                st.rendered += 1;
+                st.render_ms += ms;
+                let name = format!("fx-{:?}-{}", key.0, key.1);
+                let tex = inner.ctx.load_texture(name, img, TextureOptions::LINEAR);
+                st.thumbs.insert(key, Tex { tex, base: base.id });
+            }
+            Err(e) => {
+                // Loud in the log; the item keeps its icon. It stays marked as pending for this base
+                // (no retry loop); a new base retries it.
+                st.failed += 1;
+                if st.last_error.as_deref() != Some(e.as_str()) {
+                    eprintln!("aiframes: effect thumbnail {:?}: {e}", key.0);
+                    st.last_error = Some(e);
+                }
+                st.pending.insert(key);
+            }
+        }
+        drop(st);
+        inner.ctx.request_repaint();
+        if playing {
+            std::thread::sleep(PLAYING_GAP);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hover preview in the program viewer
+// ---------------------------------------------------------------------------------------------
+
+/// Pointer rest on an item before the viewer previews it (moving across the list does not thrash).
+const DWELL: f64 = 0.15;
+
+/// Drives the live preview of the hovered browser item in the program viewer. After a short dwell it
+/// returns, every frame, the ops of what a click would do; the app shows them through its transient
+/// op preview (a scratch copy of the document on the playback engine; nothing enters the history) and
+/// restores the document's picture when they stop. When the result is not visible at the playhead (a
+/// transition on another cut, an effect on a clip elsewhere, a title still drawing on) the playhead
+/// moves there for the hover and comes back afterwards. A clicked item is not previewed again until
+/// the pointer leaves it (it is in the document now; previewing it would show it twice).
+#[derive(Default)]
+pub struct HoverCtl {
+    item: Option<BrowserDrag>,
+    since: f64,
+    /// The plan for (item, document snapshot key, selection), kept while they stay the same.
+    plan: Option<(BrowserDrag, (u64, u64, u64), Vec<Id>, Option<PreviewPlan>)>,
+    /// (document, playhead before the preview moved it, where it moved it).
+    restore: Option<(u64, f64, f64)>,
+    /// The playhead was checked for this plan.
+    placed: bool,
+    suppressed: Option<BrowserDrag>,
+    /// Text for the viewer overlay while previewing (or why nothing previews).
+    pub note: Option<String>,
+    /// True while ops are being previewed.
+    pub previewing: bool,
+}
+
+impl HoverCtl {
+    /// Per UI frame. `hovered` is the browser's hovered item (`None` when the browser is not shown),
+    /// `clicked` whether the browser emitted an action this frame. Returns the ops to preview now.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step(&mut self, ctx: &egui::Context, engine: &mut crate::playback::Engine, doc: &Arc<Snapshot>, selection: &[Id], hovered: Option<BrowserDrag>, clicked: bool, now: f64) -> Option<Vec<aiframes_core::Op>> {
+        if clicked {
+            self.suppressed = hovered.clone();
+        }
+        if self.suppressed.is_some() && self.suppressed != hovered {
+            self.suppressed = None;
+        }
+        let want = hovered.filter(|h| Some(h) != self.suppressed.as_ref());
+        if want != self.item || clicked {
+            self.end(engine, doc);
+            self.item = want;
+            self.since = now;
+        }
+        let item = self.item.clone()?;
+        if now - self.since < DWELL {
+            ctx.request_repaint_after(Duration::from_secs_f64(DWELL));
+            return None;
+        }
+        let fresh = !matches!(&self.plan, Some((i, k, s, _)) if *i == item && *k == doc.key() && s.as_slice() == selection);
+        if fresh {
+            // A title or shape is placed so that it has finished drawing itself on at the playhead.
+            let t = engine.time();
+            let playhead = match item {
+                BrowserDrag::Text(_) | BrowserDrag::Shape(_) => (t - PRESET_SETTLE).max(0.0),
+                _ => t,
+            };
+            let plan = preview_plan(&item, &doc.project, &doc.resolved, selection, playhead);
+            self.plan = Some((item.clone(), doc.key(), selection.to_vec(), plan));
+            self.placed = false;
+        }
+        let Some(plan) = self.plan.as_ref().and_then(|(.., p)| p.clone()) else {
+            self.previewing = false;
+            self.note = Some(match &item {
+                BrowserDrag::Effect(_) => format!("Select a picture clip to preview {} on it", item.label()),
+                BrowserDrag::Transition(_) => format!("Select a clip next to a cut (or a transition) to preview {}", item.label()),
+                _ => format!("{} cannot be previewed here", item.label()),
+            });
+            return None;
+        };
+        // Show it where it can be seen: on the cut, inside the clip, after a title's reveal.
+        if !self.placed && !engine.playing() {
+            self.placed = true;
+            let t = engine.time();
+            let visible = match plan.span {
+                Some((a, b)) => t >= a && t < b,
+                None => (t - plan.at).abs() < 0.5 / doc.fps(),
+            };
+            if !visible {
+                let back = self.restore.map(|(_, b, _)| b).unwrap_or(t);
+                engine.seek(plan.at, false);
+                self.restore = Some((doc.doc, back, engine.time()));
+            }
+        }
+        self.previewing = true;
+        self.note = Some(format!("Preview: {} — click to apply", item.label()));
+        Some(plan.ops)
+    }
+
+    /// Back to the document's playhead (the app restores the picture when no preview ops come).
+    fn end(&mut self, engine: &mut crate::playback::Engine, doc: &Arc<Snapshot>) {
+        if let Some((d, before, moved)) = self.restore.take() {
+            // Only when the person has not moved the playhead since.
+            if d == doc.doc && !engine.playing() && (engine.time() - moved).abs() < 1e-6 {
+                engine.seek(before, false);
+            }
+        }
+        self.plan = None;
+        self.placed = false;
+        self.previewing = false;
+        self.note = None;
+    }
+}
+
+/// The hover preview's note over the top-left of the viewer ("Preview: Glow — click to apply").
+pub fn draw_note(ctx: &egui::Context, viewer: egui::Rect, note: &str, previewing: bool) {
+    if !viewer.is_positive() {
+        return;
+    }
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("aiframes_fx_hover_note")));
+    let font = egui::FontId::proportional(12.5);
+    let g = painter.layout_no_wrap(note.to_string(), font, egui::Color32::WHITE);
+    let r = egui::Rect::from_min_size(viewer.left_top() + egui::vec2(14.0, 30.0), g.size() + egui::vec2(16.0, 8.0));
+    let fill = if previewing { egui::Color32::from_rgba_unmultiplied(0x4C, 0xA3, 0xFF, 230) } else { egui::Color32::from_rgba_unmultiplied(0x30, 0x30, 0x36, 235) };
+    painter.rect_filled(r, egui::CornerRadius::same(4), fill);
+    painter.galley(r.min + egui::vec2(8.0, 4.0), g, egui::Color32::WHITE);
+}

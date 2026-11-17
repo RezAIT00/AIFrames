@@ -18,6 +18,7 @@ pub mod actions;
 mod backend;
 mod cli;
 pub mod demo;
+pub mod fx_preview;
 mod schema;
 mod tools;
 pub mod transcripts;

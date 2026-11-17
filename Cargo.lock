@@ -50,6 +50,7 @@ dependencies = [
  "chrono",
  "cpal",
  "eframe",
+ "rayon",
  "rfd",
  "serde",
  "serde_json",

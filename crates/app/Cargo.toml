@@ -24,5 +24,7 @@ serde_json.workspace = true
 chrono.workspace = true
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "clipboard", "links"] }
 rfd = "0.17.2"
+# (added) A small low-priority pool for effect thumbnails (same version as aiframes-render uses).
+rayon = "1"
 # Audio output for playback (the audio clock is the master clock).
 cpal = "0.15"
