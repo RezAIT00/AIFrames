@@ -483,7 +483,7 @@ pub fn schema_docs() -> Value {
             fields(vec![
                 ("kind", req("string", "", "Registry name: color, blur, sharpen, vignette, chroma_key, mask_rect, drop_shadow, glow, lut, ...", json!("vignette"))),
                 ("enabled", opt("boolean", json!(true), "", "Bypass when false.", json!(false))),
-                ("params", opt("map<string, param>", json!({}), "per the registry", "Numeric parameters (may be animated).", json!({"amount": 0.6}))),
+                ("params", opt("map<string, param>", json!({}), "per the registry", "Numeric parameters (may be animated). list_effects gives each one's default, valid range min–max (values outside it, or unknown names, are refused), unit (frac = 0–1, shown as % in the inspector; px = project pixels; deg; x = multiplier; stops; s; hz; count = whole number; ratio; toggle = 0/1), named values in its help (\"0 = auto, 1 = behind\"), and `slider`/`curve` where the inspector's slider covers only the useful part of the range or is not linear.", json!({"amount": 0.6}))),
                 ("colors", opt("map<string, color>", json!({}), "", "Colour parameters.", json!({"color": "#000000"}))),
                 ("strings", opt("map<string, string>", json!({}), "", "String parameters (e.g. a LUT file path).", json!({}))),
             ]),
@@ -522,7 +522,7 @@ pub fn schema_docs() -> Value {
                 ("to", req("string (clip id)", "", "Incoming clip (starts where `from` ends).", json!("c2"))),
                 ("kind", req("string", "", "Registry name: crossfade, dip_black, dip_white, wipe_left, slide_left, push_left, zoom_in, iris, blur_dissolve, whip, ...", json!("crossfade"))),
                 ("duration", req("number", "s", "Total length, half before and half after the cut.", json!(0.5))),
-                ("params", opt("map<string, number>", json!({}), "per the registry", "Transition parameters.", json!({}))),
+                ("params", opt("map<string, number>", json!({}), "per the registry", "Transition parameters, described like effect parameters by list_transitions (default, min–max, unit, help, slider, curve).", json!({}))),
                 ("colors", opt("map<string, color>", json!({}), "", "Colour parameters (e.g. film_burn's `color`); missing ones take the registry default.", json!({"color": "#FF8A2B"}))),
             ]),
             json!({"id": "t2", "from": "c2", "to": "c3", "kind": "dip_black", "duration": 0.6}),

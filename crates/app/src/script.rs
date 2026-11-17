@@ -2,7 +2,8 @@
 //! injected into egui's raw input frame by frame, with screenshots along the way.
 //!
 //! One command per line (`#` comments), coordinates in points:
-//! `wait N` · `move X Y` · `click X Y [mods]` · `dblclick X Y` · `drag X1 Y1 X2 Y2 [mods]` ·
+//! `wait N` · `move X Y` · `click X Y [mods]` · `dblclick X Y` · `drag X1 Y1 X2 Y2 [mods]` · `press X Y` /
+//! `release X Y` (a drag held across other commands, e.g. a `shot` mid-drag) · `rclick X Y` ·
 //! `key NAME [mods]` (mods: ctrl, shift, alt joined by `+`) · `text STRING` · `shot PATH` ·
 //! `drop X Y PATH` (a file dropped from Explorer at X,Y) · `hover X Y PATH` (dragged over, not
 //! dropped; `hover off` ends it) · `copy` / `cut` / `paste [TEXT]` (the clipboard events egui
@@ -38,6 +39,9 @@ pub struct Frame {
     /// frames until ended, like a real drag.
     pub hover: Option<Vec<PathBuf>>,
 }
+
+/// Frames before the first scripted event (the window settles).
+const WARMUP: u32 = 60;
 
 pub struct Script {
     frames: VecDeque<Frame>,
@@ -115,6 +119,19 @@ impl Script {
                     frames.push_back(frame(vec![button(b, false, m)], m));
                     frames.push_back(Frame::default());
                 }
+                "rclick" => {
+                    let p = pos2(num(0), num(1));
+                    let b = |pressed| Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed, modifiers: Modifiers::NONE };
+                    frames.push_back(frame(vec![Event::PointerMoved(p)], Modifiers::NONE));
+                    frames.push_back(frame(vec![b(true)], Modifiers::NONE));
+                    frames.push_back(frame(vec![b(false)], Modifiers::NONE));
+                    frames.push_back(Frame::default());
+                }
+                "press" | "release" => {
+                    let p = pos2(num(0), num(1));
+                    let m = mods(args.get(2).copied());
+                    frames.push_back(frame(vec![Event::PointerMoved(p), button(p, cmd == "press", m)], m));
+                }
                 "key" => {
                     let m = mods(args.get(1).copied());
                     if let Some(key) = args.first().and_then(|k| Key::from_name(k)) {
@@ -150,12 +167,24 @@ impl Script {
                 _ => {}
             }
         }
-        Script { frames, warmup: 60, hovering: Vec::new(), waiting: Arc::new(AtomicBool::new(false)) }
+        Script { frames, warmup: WARMUP, hovering: Vec::new(), waiting: Arc::new(AtomicBool::new(false)) }
     }
 
     /// Adds this frame's synthetic input. Returns the frame when it has a screenshot or exit request.
     pub fn inject(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) -> Option<Frame> {
         ctx.request_repaint();
+        if self.warmup == WARMUP {
+            // A covered window runs no ui passes (eframe only ticks its logic), which would swallow
+            // scripted clicks: keep it on top while the script runs.
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        }
+        let v = raw.viewport();
+        if v.occluded == Some(true) || v.minimized == Some(true) {
+            return None;
+        }
+        // The script owns the pointer: a real mouse over the window would otherwise move it between a
+        // scripted press and release (no click) or hover other widgets.
+        raw.events.retain(|e| !matches!(e, Event::PointerMoved(_) | Event::PointerButton { .. } | Event::PointerGone | Event::MouseMoved(_) | Event::MouseWheel { .. }));
         if self.warmup > 0 {
             self.warmup -= 1;
             return None;

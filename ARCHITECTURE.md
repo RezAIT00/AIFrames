@@ -73,7 +73,10 @@ pub fn fade_gain(clip: &Clip, t_local: f64) -> f64;          // fade_in/out enve
 pub fn local_time_of_source(clip: &Clip, source_t: f64) -> Option<f64>; // inverse (for word anchors)
 
 // effects.rs — data-driven registries (also drive the UI inspector and the MCP `list_effects` tool)
-pub struct ParamSpec { pub name: &'static str, pub label: &'static str, pub default: f64, pub min: f64, pub max: f64, pub unit: &'static str, pub help: &'static str }
+pub struct ParamSpec { pub name: &'static str, pub label: &'static str, pub default: f64, pub min: f64, pub max: f64, pub unit: &'static str, pub help: &'static str,
+                       pub slider: Option<[f64; 2]> /* the inspector slider's useful part of min..max */, pub curve: f64 /* 1 linear, 2–3 finer low end, 0 log */ }
+pub fn slider_value(p: &ParamSpec, f: f64) -> f64;   // slider position 0..1 → value (inspector, tests/param_sweep.rs); slider_pos is the inverse
+impl ParamSpec { pub fn choices(&self) -> Option<Vec<(f64, String)>> }  // "0 = left, 1 = right" in the help → a drop-down
 pub struct EffectSpec { pub kind: &'static str, pub label: &'static str, pub category: &'static str, pub params: &'static [ParamSpec], pub colors: &'static [(&'static str, &'static str)], pub strings: &'static [&'static str], pub help: &'static str }
 pub struct TransitionSpec { pub kind: &'static str, pub label: &'static str, pub params: &'static [ParamSpec], pub help: &'static str }
 pub static EFFECTS: &[EffectSpec];      // at least: color (exposure, contrast, saturation, temperature, tint, brightness, gamma, highlights, shadows),
@@ -256,8 +259,9 @@ CLI (same code, headless): `aiframes new|import|describe|validate|apply ops.json
 
 Dark, dense, Premiere/Resolve-like, using `suite-ui`. Panels: media bin (import dialog, drag-drop from Explorer, thumbnails, info,
 notes), program viewer (play/pause, JKL shuttle, frame step, in/out, safe-area guides, zoom, on-canvas transform handles for the
-selected clip), timeline (the widget), inspector (clip properties with keyframe toggles + mini curve, effects stack from the registry,
-text editing, transitions, audio), transcript editor (select words → delete = ripple cut; click word = seek), history panel (every
+selected clip), timeline (the widget), inspector (effects first, then clip properties with keyframe toggles + mini curve; one control
+per registry parameter with its units, slider range and reset; live viewer preview while dragging through `UiAction::Preview`, one
+op per drag; text editing, transitions, audio; the selected clip's effect controls are also docked under the effects browser), transcript editor (select words → delete = ripple cut; click word = seek), history panel (every
 entry with its author; AI entries highlighted; undo), AI panel (prompt box that runs Claude Code headless against this window's
 MCP endpoint, streaming its progress; AI-changed clips flash in the timeline), export dialog (presets: YouTube 1080p, 4K, Shorts
 1080×1920, ProRes, GIF; loudness target; progress + cancel), project settings. Autosave. Keyboard shortcuts: Space, J/K/L,

@@ -194,7 +194,7 @@ fn new_effects_and_transitions_are_registered() {
     let fx: &[(&str, &[&str])] = &[
         ("directional_blur", &["angle", "length"]),
         ("glitch", &["amount", "slices", "seed", "rgb"]),
-        ("echo", &["count", "interval", "decay"]),
+        ("echo", &["count", "interval", "decay", "mode"]),
         ("stutter", &["rate", "hold"]),
         ("edge_glow", &["threshold", "radius", "intensity"]),
         ("lens_distortion", &["amount"]),

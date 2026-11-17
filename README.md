@@ -48,9 +48,16 @@ installed copies pick it up on their next check.
   mute/solo/lock/hide and drag-to-reorder, Set spacing / Close gaps.
 - **Viewer**: smooth playback with the sound as master clock (J/K/L shuttle with 2×/4× audio, scrub audio,
   frame steps, loop in/out), on-canvas move/scale/rotate handles, safe-area guides, render warnings.
-- **Inspector**: everything about the selection, every animatable value with keyframe controls, 19 effects
-  and 19 transitions from a registry, text (system fonts, outline, shadow, pill background, reveals, karaoke
-  highlight) and shapes with draw-on, project and export settings.
+- **Inspector**: everything about the selection, every animatable value with keyframe controls, text (system
+  fonts, outline, shadow, pill background, reveals, karaoke highlight) and shapes with draw-on, project and
+  export settings.
+- **Effect controls**: 26 effects and 31 transitions from one registry (the same one `list_effects` gives the
+  AI). Adding an effect (Effects tab, drop on a clip, right-click > Add effect, the AI) selects the clip and opens
+  the new effect; the Effects tab docks the selected clip's controls under the browser. Every parameter has a
+  slider over its useful range in its units (%, px, °, EV, ×, Hz, s) plus a value to scrub or type, keyframes,
+  and reset; dragging previews live in the viewer and is one undo step. Enable/bypass, drag to reorder,
+  copy/paste effects, Attributes > paste attributes onto other clips, a file picker for LUTs. Transitions on
+  the timeline select and configure the same way.
 - **Transcript**: Whisper transcription (or import `words.json` / SRT / VTT sidecars), click a word to seek,
   select words and press Delete to cut them out of the video, captions that stay synced to the voice.
   Word cuts are measured on the audio: each edge moves onto the quietest point near the word times (which

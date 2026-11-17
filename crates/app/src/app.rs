@@ -27,6 +27,14 @@ pub const APP_NAME: &str = "AIFrames";
 const MEDIA_EXTS: &[&str] = &["mp4", "mov", "mkv", "webm", "avi", "m4v", "mxf", "mts", "ts", "wmv", "flv", "mp3", "wav", "aac", "m4a", "flac", "ogg", "opus", "aif", "aiff", "wma", "png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "exr"];
 
 /// The editing widgets of one project.
+/// What the viewer shows for a `UiAction::Preview`: the ops, the document snapshot they were
+/// applied to, and whether they applied (failed ones show the document unchanged).
+struct OpsPreview {
+    ops: Vec<Op>,
+    key: (u64, u64, u64),
+    shown: bool,
+}
+
 #[derive(Default)]
 pub struct Widgets {
     pub timeline: Timeline,
@@ -172,6 +180,10 @@ pub struct AiFramesApp {
     layers: ((u64, u64, u64), i64, Vec<LayerBox>),
     live_preview: Option<LivePreview>,
     preview_epoch: u64,
+    /// The latest `UiAction::Preview` of this frame (last wins).
+    frame_preview: Option<Vec<Op>>,
+    /// The ops preview the viewer shows (see [`App::finish_ops_preview`]).
+    ops_preview: Option<OpsPreview>,
     jobs_seen: HashSet<u64>,
     export_paths: HashMap<u64, PathBuf>,
     last_export: Option<PathBuf>,
@@ -273,6 +285,8 @@ impl AiFramesApp {
             layers: ((u64::MAX, 0, 0), 0, Vec::new()),
             live_preview: None,
             preview_epoch: 0,
+            frame_preview: None,
+            ops_preview: None,
             jobs_seen: HashSet::new(),
             export_paths: HashMap::new(),
             last_export: None,
@@ -919,7 +933,7 @@ impl AiFramesApp {
             self.engine_doc = Some(id);
             let t = self.docs.get(&id).map(|d| d.playhead).unwrap_or(0.0);
             self.engine.seek(t.min(dur.max(0.0)), false);
-        } else if self.live_preview.is_none() {
+        } else if self.live_preview.is_none() && !self.ops_preview.as_ref().is_some_and(|p| p.shown) {
             self.engine.set_snapshot(snap);
         }
         if let Some(t) = seek {
@@ -969,6 +983,45 @@ impl AiFramesApp {
         let _ = PARAM_PATHS;
     }
 
+    /// Shows this frame's `UiAction::Preview` (uncommitted ops: a slider being dragged, an effect
+    /// being hovered) in the viewer. The transient snapshot is rebuilt only when the ops or the
+    /// document's snapshot change; ops that do not apply are skipped quietly. The first frame without
+    /// a preview hands the viewer back to the document (its new revision if the preview was just
+    /// committed), so the picture never jumps back to the state before the drag.
+    fn finish_ops_preview(&mut self, id: Option<u64>, ctx: &egui::Context) {
+        let want = self.frame_preview.take();
+        let base = id.and_then(|id| self.docs.get(&id)).and_then(|d| d.snap.clone());
+        match (want, base) {
+            (Some(ops), Some(base)) if self.live_preview.is_none() && self.engine_doc == id => {
+                let key = base.key();
+                if self.ops_preview.as_ref().is_some_and(|p| p.ops == ops && p.key == key) {
+                    return;
+                }
+                let mut project = base.project.clone();
+                let shown = aiframes_core::apply_batch(&mut project, &ops).is_ok();
+                if shown {
+                    let resolved = aiframes_core::resolve(&project);
+                    self.preview_epoch += 1;
+                    let snap = Arc::new(Snapshot { doc: base.doc, revision: base.revision, epoch: 1_000_000 + self.preview_epoch, project, resolved, dir: base.dir.clone() });
+                    self.engine.set_snapshot(snap);
+                    if ctx.input(|i| i.pointer.primary_down()) {
+                        // A slider being dragged: a fast draft first, like scrubbing.
+                        self.engine.set_scrubbing(true);
+                    }
+                } else if self.ops_preview.as_ref().is_some_and(|p| p.shown) {
+                    self.engine.set_snapshot(base);
+                }
+                self.ops_preview = Some(OpsPreview { ops, key, shown });
+            }
+            _ => {
+                if self.ops_preview.take().is_some_and(|p| p.shown) {
+                    // The next frame's snapshot refresh puts the document back on the engine.
+                    ctx.request_repaint();
+                }
+            }
+        }
+    }
+
     fn layers_for(&mut self, snap: &Snapshot, t: f64) -> Vec<LayerBox> {
         let f = frame_index(t, snap.fps());
         if self.layers.0 != snap.key() || self.layers.1 != f {
@@ -994,7 +1047,10 @@ impl AiFramesApp {
                 }
             }
             UiAction::Apply { label, ops } => {
-                self.apply(id, &label, ops);
+                let added = added_effects(&ops);
+                if self.apply(id, &label, ops) && !added.is_empty() {
+                    self.show_added_effects(id, &added);
+                }
             }
             UiAction::Undo => self.run(Command::Undo, ctx),
             UiAction::Redo => self.run(Command::Redo, ctx),
@@ -1054,6 +1110,8 @@ impl AiFramesApp {
                 }
             }
             UiAction::RelinkMedia(asset) => self.relink(id, &asset),
+            UiAction::Preview(ops) => self.frame_preview = Some(ops),
+            UiAction::PickEffectFile { clip, index, name } => self.pick_effect_file(id, &clip, index, &name),
             #[allow(unreachable_patterns)]
             _ => {}
         }
@@ -1778,6 +1836,55 @@ impl AiFramesApp {
     }
 
     /// Asks for a new file for a media asset and relinks it (probing in the background).
+    /// After the person added effects: select their clip(s) and reveal the new effect's controls, in
+    /// the docked Effect controls when the Effects tab is open (so browsing goes on), else in the
+    /// Inspector, which is brought up.
+    fn show_added_effects(&mut self, id: u64, added: &[(Id, Option<usize>)]) {
+        let counts: Vec<(Id, usize)> = self
+            .with_doc(id, |d| added.iter().filter_map(|(c, i)| d.doc.project.clips.iter().find(|x| &x.id == c).map(|x| (c.clone(), i.unwrap_or(x.effects.len().saturating_sub(1))))).collect())
+            .unwrap_or_default();
+        let Some((first, index)) = counts.first().cloned() else { return };
+        if let Some(d) = self.docs.get_mut(&id) {
+            let mut clips: Vec<Id> = counts.iter().map(|(c, _)| c.clone()).collect();
+            clips.dedup();
+            if !clips.iter().all(|c| d.selection.contains(c)) {
+                d.selection = clips;
+            }
+            d.w.inspector.reveal_effect(&first, index);
+        }
+        self.prefs.layout.show_side = true;
+        if self.side_tab != SideTab::Effects {
+            self.side_tab = SideTab::Inspector;
+        } else {
+            self.status = format!("{} — adjust it in Effect controls below or in the Inspector", self.status);
+        }
+    }
+
+    /// Asks for a file for an effect's string parameter (a LUT's .cube) and sets it: relative to the
+    /// project folder when it is inside it, else absolute.
+    fn pick_effect_file(&mut self, id: u64, clip: &str, index: usize, name: &str) {
+        let Some((dir, cur)) = self
+            .with_doc(id, |d| {
+                let cur = d.doc.project.clips.iter().find(|c| c.id == clip).and_then(|c| c.effects.get(index)).and_then(|e| e.strings.get(name).cloned());
+                (d.doc.project_dir(), cur)
+            })
+        else {
+            return;
+        };
+        let mut dlg = rfd::FileDialog::new().set_title("Choose a LUT (.cube)").add_filter("3D LUT", &["cube"]).add_filter("All files", &["*"]);
+        let start = cur.map(|c| dir.join(c)).and_then(|p| p.parent().map(Path::to_path_buf)).filter(|d| d.is_dir()).unwrap_or_else(|| dir.clone());
+        dlg = dlg.set_directory(start);
+        let Some(path) = dlg.pick_file() else { return };
+        let stored = match path.strip_prefix(&dir) {
+            Ok(rel) if dir.is_dir() => rel.to_path_buf(),
+            _ => path.clone(),
+        };
+        let mut strings = std::collections::BTreeMap::new();
+        strings.insert(name.to_string(), Some(stored.to_string_lossy().replace('\\', "/")));
+        let op = Op::SetEffect { clip: clip.into(), index, enabled: None, params: Default::default(), colors: Default::default(), strings };
+        self.apply(id, &format!("{name} of effect {index} ({clip})"), vec![op]);
+    }
+
     fn relink(&mut self, id: u64, asset: &str) {
         let Some((name, old)) = self.with_doc(id, |d| d.doc.project.media.iter().find(|m| m.id == asset).map(|m| (m.name.clone(), d.doc.media_path(m)))).flatten() else { return };
         let mut dlg = rfd::FileDialog::new().set_title(format!("Relink {asset} {name}")).add_filter("Media", MEDIA_EXTS).add_filter("All files", &["*"]);
@@ -2442,7 +2549,11 @@ impl eframe::App for AiFramesApp {
                         ui.set_min_size(ui.available_size());
                         match self.side_tab {
                             SideTab::Inspector => actions.extend(w.inspector.ui(ui, &cx)),
-                            SideTab::Effects => actions.extend(w.effects.ui(ui, &cx)),
+                            SideTab::Effects => {
+                                // The selected clip's effect controls, docked under the browser.
+                                actions.extend(w.inspector.effect_controls(ui, &cx));
+                                actions.extend(w.effects.ui(ui, &cx));
+                            }
                             SideTab::Transcript => actions.extend(w.transcript.ui(ui, &cx)),
                             SideTab::History => actions.extend(w.history.ui(ui, &cx)),
                             SideTab::Review => actions.extend(w.review.ui(ui, &cx)),
@@ -2573,6 +2684,8 @@ impl eframe::App for AiFramesApp {
                 self.handle_action(id, a, &ctx);
             }
         }
+        // After every widget ran: the last `UiAction::Preview` of the frame wins.
+        self.finish_ops_preview(active_id, &ctx);
         // AI edits to bring into view (after the timeline laid itself out this frame).
         if let Some((id, ids, at, latest)) = self.pending_follow.clone() {
             if self.now - at >= 1.2 {
@@ -2709,6 +2822,11 @@ impl eframe::App for AiFramesApp {
         }
         self.ai.stop();
     }
+}
+
+/// The clips (and effect indices, when given) that `AddEffect` ops in a user edit add effects to.
+fn added_effects(ops: &[Op]) -> Vec<(Id, Option<usize>)> {
+    ops.iter().filter_map(|o| if let Op::AddEffect { clip, index, .. } = o { Some((clip.clone(), *index)) } else { None }).collect()
 }
 
 /// "V1 Main": a track's id (upper case) and name.

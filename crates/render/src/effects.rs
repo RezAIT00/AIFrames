@@ -148,10 +148,13 @@ fn apply_one(layer: &mut Layer, e: &Effect, cx: &FxCtx) -> Result<(), String> {
         }
         "sharpen" => {
             let amount = p("amount").clamp(0.0, 100.0) as f32;
-            let sigma = size("radius").max(0.1 * s) as f32;
-            if amount > 0.0 && sigma > 0.2 {
+            // At least 0.6 canvas px: the box-blur approximation of a narrower Gaussian is the
+            // identity, so a radius under 0.6 px (or any radius in a reduced-size preview) would show
+            // no sharpening at all.
+            let sigma = size("radius").max(0.6) as f32;
+            if amount > 0.0 {
                 let mut soft = layer.clone();
-                blur::gaussian(&mut soft, sigma.max(0.31), passes);
+                blur::gaussian(&mut soft, sigma, passes);
                 let src = &soft;
                 let r = layer.rect;
                 let w = layer.stride();

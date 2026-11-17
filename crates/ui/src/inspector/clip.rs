@@ -5,12 +5,11 @@ use super::param::Local;
 use super::*;
 use crate::widgets::{fitw, narrow, NumSpec};
 use aiframes_core::{
-    effect_spec, eval, Align, Anchor, AnchorTarget, BlendMode, Clip, Edge, EffectArg, Fit, MediaKind, Param, RevealKind, ShapeKind, Source, SpeedKeep, Time, TrackKind,
-    WordRef, EFFECTS,
+    eval, Align, Anchor, AnchorTarget, BlendMode, Clip, Edge, Fit, MediaKind, Param, RevealKind, ShapeKind, Source, SpeedKeep, Time, TrackKind, WordRef,
 };
 use egui::{ComboBox, Grid, RichText};
 use serde_json::json;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 /// The kinds offered by the anchor editor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -371,7 +370,8 @@ impl Inspector {
     #[allow(clippy::too_many_arguments)]
     fn clip_row(&mut self, ui: &mut Ui, cx: &EditCtx, c: &Clip, local: &Local, path: &str, param: &Param, out: &mut Vec<UiAction>) -> Option<Op> {
         let (label, help, spec) = super::clip_spec(path);
-        self.param_row(ui, cx, c, local, path, label, help, param, &spec, out)
+        let default = aiframes_core::clip_param_spec(path).map(|p| p.default);
+        self.param_row(ui, cx, c, local, path, label, help, param, &spec, default, out)
     }
 
     pub(crate) fn clip_panel(&mut self, ui: &mut Ui, cx: &EditCtx, c: &Clip, out: &mut Vec<UiAction>) {
@@ -393,6 +393,7 @@ impl Inspector {
                 if ui.small_button("Ask AI").on_hover_text("Ask the AI about this clip").clicked() {
                     out.push(UiAction::AskAi { prompt: format!("About clip {} (\"{}\"): ", c.id, util::clip_label(p, c)), ids: vec![c.id.clone()] });
                 }
+                self.attributes_menu(ui, &[c], Some(c), out);
             });
         });
         if let Some(e) = cx.resolved.error_for(&c.id) {
@@ -408,6 +409,13 @@ impl Inspector {
                     out.push(UiAction::Apply { label: format!("Fix {} ({})", f.code, c.id), ops: f.fix_ops.clone() });
                 }
             });
+        }
+
+        // Effects first: they are what people adjust most (Premiere's Effect Controls, Resolve's
+        // Inspector), and below the long transform sections they were easy to miss.
+        if kind != ClipKind::Audio {
+            let force = self.reveal.as_ref().is_some_and(|(id, _)| *id == c.id);
+            section_with(ui, &format!("Effects ({})", c.effects.len()), &c.id, true, force, |ui| self.effects_stack(ui, cx, c, &local, &mut ops, out));
         }
 
         // Identity.
@@ -710,11 +718,6 @@ impl Inspector {
                 ui.add(egui::Label::new(RichText::new("Adjustment layer: its effects apply to everything below it.").small().weak()).wrap());
             }
             Source::Media { .. } => {}
-        }
-
-        // Effects.
-        if kind != ClipKind::Audio {
-            section(ui, &format!("Effects ({})", c.effects.len()), &c.id, true, |ui| self.effects_stack(ui, cx, c, &local, &mut ops, out));
         }
 
         let _ = fps;
@@ -1230,148 +1233,6 @@ impl Inspector {
         });
     }
 
-    fn effects_stack(&mut self, ui: &mut Ui, cx: &EditCtx, c: &Clip, local: &Local, ops: &mut Vec<(String, Op)>, out: &mut Vec<UiAction>) {
-        let n = c.effects.len();
-        for (i, e) in c.effects.iter().enumerate() {
-            let spec = effect_spec(&e.kind);
-            let frame = egui::Frame::new().fill(style::rgb(0x23, 0x24, 0x28)).corner_radius(4).inner_margin(egui::Margin::symmetric(6, 4)).stroke(egui::Stroke::new(1.0, style::rgb(0x2E, 0x30, 0x35)));
-            let resp = frame
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let handle = crate::widgets::grip(ui).on_hover_text("Drag to reorder");
-                        handle.dnd_set_drag_payload(EffectSlot { clip: c.id.clone(), index: i });
-                        let mut en = e.enabled;
-                        if ui.checkbox(&mut en, "").on_hover_text("Enable / bypass").changed() {
-                            ops.push(("Toggle effect".into(), Op::SetEffect { clip: c.id.clone(), index: i, enabled: Some(en), params: Default::default(), colors: Default::default(), strings: Default::default() }));
-                        }
-                        let open_key = format!("{}.fx{i}", c.id);
-                        let open = !self.collapsed.contains(&open_key);
-                        let title = ui.selectable_label(open, RichText::new(spec.map(|s| s.label).unwrap_or(&e.kind)).strong());
-                        if let Some(s) = spec {
-                            title.clone().on_hover_text(s.help);
-                        }
-                        if title.clicked() {
-                            if open {
-                                self.collapsed.insert(open_key);
-                            } else {
-                                self.collapsed.remove(&open_key);
-                            }
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("×").on_hover_text("Remove").clicked() {
-                                ops.push(("Remove effect".into(), Op::RemoveEffect { clip: c.id.clone(), index: i }));
-                            }
-                            if crate::widgets::dir_button(ui, crate::widgets::Dir::Down, i + 1 < n, "Move down").clicked() {
-                                ops.push(("Move effect".into(), Op::MoveEffect { clip: c.id.clone(), from: i, to: i + 1 }));
-                            }
-                            if crate::widgets::dir_button(ui, crate::widgets::Dir::Up, i > 0, "Move up").clicked() {
-                                ops.push(("Move effect".into(), Op::MoveEffect { clip: c.id.clone(), from: i, to: i - 1 }));
-                            }
-                        });
-                    });
-                    let open_key = format!("{}.fx{i}", c.id);
-                    if self.collapsed.contains(&open_key) {
-                        return;
-                    }
-                    let Some(spec) = spec else {
-                        ui.colored_label(style::ERROR, format!("Unknown effect {:?}", e.kind));
-                        return;
-                    };
-                    Grid::new(("fx", &c.id, i)).num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
-                        for ps in spec.params {
-                            let path = format!("effects.{i}.{}", ps.name);
-                            let cur = e.params.get(ps.name).cloned().unwrap_or(Param::Value(ps.default));
-                            if ps.unit == "toggle" {
-                                lbl(ui, ps.label).on_hover_text(ps.help);
-                                let mut on = eval::sample(&cur, local.t) >= 0.5;
-                                if ui.checkbox(&mut on, "").changed() {
-                                    let mut m = BTreeMap::new();
-                                    m.insert(ps.name.to_string(), Some(Param::Value(if on { 1.0 } else { 0.0 })));
-                                    ops.push((ps.label.into(), Op::SetEffect { clip: c.id.clone(), index: i, enabled: None, params: m, colors: Default::default(), strings: Default::default() }));
-                                }
-                                ui.end_row();
-                                continue;
-                            }
-                            let unit: &'static str = match ps.unit {
-                                "px" => " px",
-                                "deg" => "°",
-                                "x" => "×",
-                                "stops" => " st",
-                                "hz" => " Hz",
-                                "s" => " s",
-                                _ => "",
-                            };
-                            let decimals = if ps.unit == "count" { 0 } else if ps.max - ps.min > 50.0 { 1 } else { 3 };
-                            let spec_n = if ps.unit == "count" { NumSpec::drag(ps.min, ps.max, 0.25, unit, 0) } else { NumSpec { width: 120.0, ..NumSpec::slider(ps.min, ps.max, unit, decimals) } };
-                            if let Some(op) = self.param_row(ui, cx, c, local, &path, ps.label, ps.help, &cur, &spec_n, out) {
-                                ops.push((ps.label.into(), op));
-                            }
-                        }
-                        for (name, def) in spec.colors {
-                            lbl(ui, name);
-                            let cur = e.colors.get(*name).copied().or_else(|| aiframes_core::Color::parse(def)).unwrap_or(aiframes_core::Color::BLACK);
-                            ui.horizontal(|ui| {
-                                if let Some(nc) = self.fields.color(ui, &format!("{}.fx{i}.{name}", c.id), cur) {
-                                    let mut m = BTreeMap::new();
-                                    m.insert(name.to_string(), Some(nc));
-                                    ops.push(("Effect colour".into(), Op::SetEffect { clip: c.id.clone(), index: i, enabled: None, params: Default::default(), colors: m, strings: Default::default() }));
-                                }
-                                if e.colors.contains_key(*name) && ui.small_button("Reset").clicked() {
-                                    let mut m = BTreeMap::new();
-                                    m.insert(name.to_string(), None);
-                                    ops.push(("Reset colour".into(), Op::SetEffect { clip: c.id.clone(), index: i, enabled: None, params: Default::default(), colors: m, strings: Default::default() }));
-                                }
-                            });
-                            ui.end_row();
-                        }
-                        for name in spec.strings {
-                            lbl(ui, name);
-                            let cur = e.strings.get(*name).cloned().unwrap_or_default();
-                            if let Some(v) = self.fields.text(ui, &format!("{}.fx{i}.s.{name}", c.id), &cur, false, 170.0, "path") {
-                                let mut m = BTreeMap::new();
-                                m.insert(name.to_string(), if v.is_empty() { None } else { Some(v) });
-                                ops.push(("Effect setting".into(), Op::SetEffect { clip: c.id.clone(), index: i, enabled: None, params: Default::default(), colors: Default::default(), strings: m }));
-                            }
-                            ui.end_row();
-                        }
-                    });
-                })
-                .response;
-            if let Some(slot) = resp.dnd_release_payload::<EffectSlot>() {
-                if slot.clip == c.id && slot.index != i {
-                    ops.push(("Reorder effects".into(), Op::MoveEffect { clip: c.id.clone(), from: slot.index, to: i }));
-                }
-            } else if resp.dnd_hover_payload::<EffectSlot>().is_some_and(|s| s.clip == c.id && s.index != i) {
-                ui.painter().hline(resp.rect.x_range(), resp.rect.top() - 1.0, egui::Stroke::new(2.0, style::ACCENT));
-            }
-            ui.add_space(3.0);
-        }
-        ui.menu_button("+ Add effect", |ui| {
-            let mut cats: Vec<&str> = EFFECTS.iter().map(|e| e.category).collect();
-            cats.dedup();
-            let mut seen = HashSet::new();
-            for cat in cats {
-                if !seen.insert(cat) {
-                    continue;
-                }
-                ui.menu_button(util::capitalize(cat), |ui| {
-                    for e in EFFECTS.iter().filter(|e| e.category == cat) {
-                        if ui.button(e.label).on_hover_text(e.help).clicked() {
-                            ops.push((format!("Add {}", e.label), Op::AddEffect { clip: c.id.clone(), effect: EffectArg::Kind(e.kind.into()), index: None }));
-                            ui.close();
-                        }
-                    }
-                });
-            }
-        });
-    }
-}
-
-/// Drag payload for reordering an effect stack.
-#[derive(Clone, Debug)]
-struct EffectSlot {
-    clip: Id,
-    index: usize,
 }
 
 

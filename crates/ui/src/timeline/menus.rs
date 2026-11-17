@@ -173,6 +173,26 @@ fn clip_menu(tl: &mut Timeline, ui: &mut Ui, cx: &EditCtx, lay: &Layout, id: &st
             }
         });
     });
+    if kind != ClipKind::Audio {
+        // (added) Effects by category; the new effect's controls open in the inspector.
+        ui.menu_button("Add effect", |ui| {
+            let mut cats: Vec<&str> = Vec::new();
+            for e in aiframes_core::EFFECTS {
+                if !cats.contains(&e.category) {
+                    cats.push(e.category);
+                }
+            }
+            for cat in cats {
+                ui.menu_button(util::capitalize(cat), |ui| {
+                    for e in aiframes_core::EFFECTS.iter().filter(|e| e.category == cat) {
+                        if item(ui, e.label, "") {
+                            apply(out, format!("Add {} to {id}", e.label), vec![Op::AddEffect { clip: id.into(), effect: aiframes_core::EffectArg::Kind(e.kind.into()), index: None }]);
+                        }
+                    }
+                });
+            }
+        });
+    }
     if item(ui, if c.enabled { "Disable" } else { "Enable" }, "") {
         let ops: Vec<Op> = sel.iter().filter(|s| p.clips.iter().any(|k| &k.id == *s)).map(|s| Op::SetClip { clip: s.clone(), patch: json!({"enabled": !c.enabled}) }).collect();
         apply(out, if c.enabled { "Disable clip" } else { "Enable clip" }, ops);

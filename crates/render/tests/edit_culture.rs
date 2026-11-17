@@ -256,6 +256,32 @@ fn echo_trails_behind_a_moving_clip() {
 }
 
 #[test]
+fn echo_blends_over_footage_that_fills_the_frame() {
+    // Full-frame footage moving right: echoes behind it would be hidden, so `auto` blends them over
+    // it (ghost trails at the red|blue edge); `behind` keeps the old look (nothing visible inside the
+    // frame); a cut-out (the box test above) still gets its echoes behind.
+    let mut p = project(320, 180, 30.0);
+    add_media(&mut p, "m1", &halves_png());
+    let mk = |fx: serde_json::Value| {
+        let mut q = p.clone();
+        q.clips = vec![clip(json!({"id": "c", "track": "v1", "start": 0, "duration": 2, "source": {"type": "media", "asset": "m1"},
+            "transform": {"fit": "stretch", "scale": 1.2, "x": {"keys": [{"t": 0, "v": -60}, {"t": 2, "v": 60}]}}, "effects": fx}))];
+        q
+    };
+    let plain = frame(&mk(json!([])), 1.0);
+    let auto = frame(&mk(json!([{"kind": "echo", "params": {"count": 3, "interval": 0.25}}])), 1.0);
+    let blend = frame(&mk(json!([{"kind": "echo", "params": {"count": 3, "interval": 0.25, "mode": 2}}])), 1.0);
+    let behind = frame(&mk(json!([{"kind": "echo", "params": {"count": 3, "interval": 0.25, "mode": 1}}])), 1.0);
+    assert!(diff(&auto, &plain) > 3.0, "auto echo shows on footage ({})", diff(&auto, &plain));
+    assert_eq!(auto, blend);
+    assert!(diff(&behind, &plain) < 0.05, "behind the opaque picture: hidden ({})", diff(&behind, &plain));
+    // The red|blue edge is at x = 160 now and was 15, 30, 45 px further left 0.25, 0.5, 0.75 s ago:
+    // just left of it the picture is red and the echoes (weights 0.5, 0.25, 0.125 against 1) blue.
+    let q = px(&auto, 150, 90);
+    assert!(q[2] > 40 && q[0] > 100, "a red/blue ghost mix at the edge: {q:?}");
+}
+
+#[test]
 fn stutter_holds_then_jumps() {
     let moving = json!({"transform": {"scale": 0.2, "x": {"keys": [{"t": 0, "v": -150}, {"t": 2, "v": 150}]}}});
     let p = fx_on_box(json!([{"kind": "stutter", "params": {"rate": 5, "hold": 1.0}}]), moving);

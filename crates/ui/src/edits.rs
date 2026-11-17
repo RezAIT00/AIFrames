@@ -635,21 +635,7 @@ pub fn transition_color_op(transition: &str, name: &str, color: Option<aiframes_
 /// ("0 = left, 1 = right, …", "1 = clockwise, -1 = counter-clockwise"), for a drop-down instead of a
 /// number. `None` for continuous parameters (angles, amounts) and when fewer than two are named.
 pub fn param_choices(ps: &aiframes_core::ParamSpec) -> Option<Vec<(f64, String)>> {
-    let (help, min, max) = (ps.help, ps.min, ps.max);
-    if !matches!(ps.unit, "count" | "") || max - min > 10.0 {
-        return None;
-    }
-    let mut out: Vec<(f64, String)> = Vec::new();
-    for part in help.split([',', ';', ':']) {
-        let part = part.trim().trim_end_matches('.');
-        let Some((num, label)) = part.split_once(" = ") else { continue };
-        let num = num.trim().rsplit(' ').next().unwrap_or("");
-        let (Ok(v), label) = (num.parse::<f64>(), label.trim()) else { continue };
-        if v.fract() == 0.0 && v >= min && v <= max && !label.is_empty() && !out.iter().any(|(x, _)| *x == v) {
-            out.push((v, label.to_string()));
-        }
-    }
-    (out.len() >= 2).then_some(out)
+    ps.choices()
 }
 
 /// Speed preset for a media clip (`keep: source`: faster = shorter).

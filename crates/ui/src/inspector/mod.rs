@@ -4,6 +4,7 @@
 //! when nothing is selected. Every change is one op, applied when a drag or edit ends.
 
 mod clip;
+mod fx;
 mod param;
 
 pub(crate) use clip::{match_length_op, matte_mode_label, set_until_op, with_base};
@@ -17,7 +18,7 @@ use aiframes_core::{
     Clip, Color, Id, MarkerKind, MediaAsset, MediaKind, Op, Project, Resolved, Time, TrackKind, Transition,
 };
 use egui::{ComboBox, Grid, RichText, Ui};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 /// Properties of the selection: clip (timing, source, transform/opacity/volume/speed with keyframe
 /// toggles and a small curve view, fades, blend, effects stack, text and shape editing), transition,
@@ -29,11 +30,26 @@ pub struct Inspector {
     collapsed: HashSet<String>,
     keep_duration: bool,
     last_selection: Vec<Id>,
+    /// (added) An effect card to expand and scroll into view: `(clip, index)` (see `reveal_effect`).
+    reveal: Option<(Id, usize)>,
+    /// (added) The revealed card's outline flash: `(clip, index, start time)`.
+    flash: Option<(Id, usize, Option<f64>)>,
+    /// (added) The effect kinds of the clip shown last, to notice effects others add.
+    fx_seen: Option<(Id, Vec<String>)>,
 }
 
 pub(crate) fn section(ui: &mut Ui, title: &str, id: &str, default_open: bool, add: impl FnOnce(&mut Ui)) {
+    section_with(ui, title, id, default_open, false, add)
+}
+
+/// (added) A section that `force_open` opens even if the person folded it (revealing a new effect).
+pub(crate) fn section_with(ui: &mut Ui, title: &str, id: &str, default_open: bool, force_open: bool, add: impl FnOnce(&mut Ui)) {
     let key = title.split(" (").next().unwrap_or(title).to_string();
-    let r = egui::CollapsingHeader::new(RichText::new(title).strong().size(12.0)).id_salt(("insp", key, id)).default_open(default_open).show(ui, add);
+    let mut h = egui::CollapsingHeader::new(RichText::new(title).strong().size(12.0)).id_salt(("insp", key, id)).default_open(default_open);
+    if force_open {
+        h = h.open(Some(true));
+    }
+    let r = h.show(ui, add);
     #[cfg(test)]
     if let Some(b) = r.body_response {
         tests::SECTION_W.with(|w| w.borrow_mut().push((title.to_string(), b.rect.width())));
@@ -351,6 +367,7 @@ impl Inspector {
                     }
                 }
             });
+            self.attributes_menu(ui, cs, None, out);
             if ui.button("Ask AI").clicked() {
                 out.push(UiAction::AskAi { prompt: format!("About clips {}: ", ids.join(", ")), ids: ids.clone() });
             }
@@ -365,8 +382,14 @@ impl Inspector {
             ui.label(RichText::new(&t.id).monospace().weak());
         });
         let cut = cx.resolved.span(&t.from).map(|s| s.end).unwrap_or(0.0);
-        ui.label(format!("Cut {} | {} at {}", t.from, t.to, util::timecode(cut, fps)));
+        ui.horizontal(|ui| {
+            ui.label(format!("Cut {} | {} at {}", t.from, t.to, util::timecode(cut, fps)));
+            if ui.small_button("Go to cut").on_hover_text("Move the playhead to the middle of the transition").clicked() {
+                out.push(UiAction::Seek(cut));
+            }
+        });
         let mut ops: Vec<(String, Op)> = Vec::new();
+        let previews_before = out.iter().filter(|a| matches!(a, UiAction::Preview(_))).count();
         Grid::new(("trans", &t.id)).num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
             lbl(ui, "Kind");
             let mut k = t.kind.clone();
@@ -381,73 +404,15 @@ impl Inspector {
                 ops.push(("Transition kind".into(), Op::SetTransition { transition: t.id.clone(), kind: Some(k), duration: None, params: Default::default() }));
             }
             ui.end_row();
-            lbl(ui, "Duration");
-            let max = crate::timeline::drag::transition_max(cx.resolved, &t.from, &t.to).max(1.0 / fps);
-            if let Some(d) = self.fields.num(ui, &format!("{}.dur", t.id), t.duration, &NumSpec::drag(1.0 / fps, max, 0.01, " s", 2)) {
-                ops.push(("Transition length".into(), Op::SetTransition { transition: t.id.clone(), kind: None, duration: Some(d), params: Default::default() }));
-            }
-            ui.end_row();
-            if let Some(spec) = spec {
-                let set = |name: &str, v: f64| {
-                    let mut m = BTreeMap::new();
-                    m.insert(name.to_string(), Some(v));
-                    Op::SetTransition { transition: t.id.clone(), kind: None, duration: None, params: m }
-                };
-                for ps in spec.params {
-                    lbl(ui, ps.label).on_hover_text(ps.help);
-                    let cur = transition_param(t, ps.name);
-                    // Named choices (directions, axes) as a drop-down, toggles as a checkbox, whole
-                    // numbers as a drag value, the rest as sliders in their units.
-                    if let Some(choices) = crate::edits::param_choices(ps) {
-                        let mut v = cur.round();
-                        let shown = choices.iter().find(|(x, _)| *x == v).map(|(_, l)| crate::util::capitalize(l)).unwrap_or_else(|| format!("{v}"));
-                        narrow(ui, 150.0, |ui| {
-                            ComboBox::from_id_salt(("tparam", &t.id, ps.name)).width(fitw(ui, 150.0)).truncate().selected_text(shown).show_ui(ui, |ui| {
-                                for (x, l) in &choices {
-                                    ui.selectable_value(&mut v, *x, crate::util::capitalize(l));
-                                }
-                            });
-                        });
-                        if (v - cur).abs() > 1e-9 {
-                            ops.push((ps.label.into(), set(ps.name, v)));
-                        }
-                    } else if ps.unit == "toggle" {
-                        let mut on = cur >= 0.5;
-                        if ui.checkbox(&mut on, "").changed() {
-                            ops.push((ps.label.into(), set(ps.name, if on { 1.0 } else { 0.0 })));
-                        }
-                    } else {
-                        let unit: &'static str = match ps.unit {
-                            "px" => " px",
-                            "deg" => "°",
-                            "x" => "×",
-                            _ => "",
-                        };
-                        let ns = if ps.unit == "count" { NumSpec::drag(ps.min, ps.max, 0.25, "", 0) } else { NumSpec::slider(ps.min, ps.max, unit, if ps.max - ps.min > 50.0 { 1 } else { 3 }) };
-                        if let Some(v) = self.fields.num(ui, &format!("{}.{}", t.id, ps.name), cur, &ns) {
-                            ops.push((ps.label.into(), set(ps.name, v)));
-                        }
-                    }
-                    ui.end_row();
-                }
-                // Round 6: colour parameters (a film burn's tint, a dip's colour).
-                for (name, def) in spec.colors {
-                    lbl(ui, &crate::util::capitalize(name)).on_hover_text(format!("Default {def}"));
-                    ui.horizontal(|ui| {
-                        let cur = aiframes_core::transition_color(t, name);
-                        if let Some(nc) = self.fields.color(ui, &format!("{}.color.{name}", t.id), cur) {
-                            ops.push(("Transition colour".into(), crate::edits::transition_color_op(&t.id, name, Some(nc))));
-                        }
-                        if t.colors.contains_key(*name) && ui.small_button("Reset").on_hover_text(format!("Back to {def}")).clicked() {
-                            ops.push(("Reset transition colour".into(), crate::edits::transition_color_op(&t.id, name, None)));
-                        }
-                    });
-                    ui.end_row();
-                }
-            }
+            self.transition_duration_row(ui, cx, t, &mut ops, out);
+            self.transition_params(ui, t, &mut ops, out);
         });
+        Self::seek_into_transition(cx, t, previews_before, out);
         if let Some(s) = spec {
             ui.add(egui::Label::new(RichText::new(s.help).small().weak()).wrap());
+            if s.params.is_empty() && s.colors.is_empty() {
+                ui.add(egui::Label::new(RichText::new("This transition has no settings besides its kind and length.").small().weak()).wrap());
+            }
         }
         if ui.button("Remove transition").clicked() {
             ops.push(("Remove transition".into(), Op::RemoveTransition { transition: t.id.clone() }));

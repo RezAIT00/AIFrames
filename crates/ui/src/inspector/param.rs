@@ -61,6 +61,14 @@ pub(crate) enum ParamEdit {
     Value(f64),
     AddKey(f64, f64),
     RemoveKey(f64),
+    /// Back to the default (a constant: keyframes go too).
+    Reset(f64),
+}
+
+/// `effects.N.name` → (N, name).
+pub(crate) fn effect_path(path: &str) -> Option<(usize, &str)> {
+    let (i, name) = path.strip_prefix("effects.")?.split_once('.')?;
+    Some((i.parse().ok()?, name))
 }
 
 /// The op for an edit of the parameter at `path` (pure).
@@ -78,6 +86,23 @@ pub(crate) fn param_op(clip: &str, path: &str, param: &Param, local: &Local, edi
         }
         ParamEdit::AddKey(t, v) => Op::AddKeyframe { clip: clip.into(), path: path.into(), t: local.snap(t), v, ease: None },
         ParamEdit::RemoveKey(t) => Op::RemoveKeyframe { clip: clip.into(), path: path.into(), t },
+        ParamEdit::Reset(default) => match effect_path(path) {
+            // An effect parameter left out takes the registry default.
+            Some((index, name)) => {
+                let mut params = std::collections::BTreeMap::new();
+                params.insert(name.to_string(), None);
+                Op::SetEffect { clip: clip.into(), index, enabled: None, params, colors: Default::default(), strings: Default::default() }
+            }
+            None => Op::SetParam { clip: clip.into(), path: path.into(), value: Some(default), keys: None },
+        },
+    }
+}
+
+/// Whether a parameter differs from its default (animated counts as different).
+pub(crate) fn is_changed(param: &Param, default: f64) -> bool {
+    match param {
+        Param::Value(v) => (v - default).abs() > 1e-9,
+        Param::Animated { .. } => param.is_animated(),
     }
 }
 
@@ -89,9 +114,11 @@ fn keys_of(p: &Param) -> &[Key] {
 }
 
 impl Inspector {
-    /// One row of the grid. Returns the op to apply (the caller labels it).
+    /// One row of the grid. Returns the op to apply (the caller labels it). While the value is being
+    /// dragged or typed, the viewer previews it (`UiAction::Preview`); the op comes once, at the end.
+    /// With a `default`, a reset button shows when the value differs from it.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn param_row(&mut self, ui: &mut Ui, _cx: &EditCtx, c: &Clip, local: &Local, path: &str, label: &str, help: &str, param: &Param, spec: &NumSpec, out: &mut Vec<UiAction>) -> Option<Op> {
+    pub(crate) fn param_row(&mut self, ui: &mut Ui, _cx: &EditCtx, c: &Clip, local: &Local, path: &str, label: &str, help: &str, param: &Param, spec: &NumSpec, default: Option<f64>, out: &mut Vec<UiAction>) -> Option<Op> {
         let keys = keys_of(param);
         let animated = param.is_animated();
         let cur = eval::sample(param, local.t);
@@ -132,9 +159,20 @@ impl Inspector {
             ui.add_space(4.0);
             let key = format!("{}.{path}", c.id);
             let enabled = !animated || local.inside;
-            let r = ui.add_enabled_ui(enabled, |ui| self.fields.num(ui, &key, cur, spec)).inner;
-            if let Some(v) = r {
+            let r = ui.add_enabled_ui(enabled, |ui| self.fields.num_ex(ui, &key, cur, spec)).inner;
+            if let Some(v) = r.commit {
                 edit = Some(ParamEdit::Value(v));
+            } else if let Some(v) = r.live {
+                out.push(UiAction::Preview(vec![param_op(&c.id, path, param, local, ParamEdit::Value(v))]));
+                if !local.inside {
+                    // Nothing of the clip is in the viewer: show its nearest frame while dragging.
+                    out.push(UiAction::Seek(local.start + local.t.min(local.dur - 1.0 / local.fps).max(0.0)));
+                }
+            }
+            if let Some(d) = default {
+                if is_changed(param, d) && reset_button(ui, &format!("Reset to {}", spec_text(spec, d))).clicked() {
+                    edit = Some(ParamEdit::Reset(d));
+                }
             }
             if animated {
                 let open = self.curves.contains(&key);
@@ -159,6 +197,36 @@ impl Inspector {
         }
         edit.map(|e| param_op(&c.id, path, param, local, e))
     }
+}
+
+/// A value as its field shows it ("50 %", "12 px").
+pub(crate) fn spec_text(spec: &NumSpec, v: f64) -> String {
+    let d = spec.scale.show(v);
+    let s = format!("{:.*}", spec.decimals.min(3), d);
+    let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s };
+    format!("{s}{}", spec.suffix)
+}
+
+/// The small "reset to default" button of a parameter row: a painted counter-clockwise arrow (the
+/// default fonts have no ↺).
+pub(crate) fn reset_button(ui: &mut Ui, tip: &str) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+    let col = if r.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+    if r.hovered() {
+        ui.painter().rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let c = rect.center();
+    let rad = 4.5f32;
+    // A 270° arc from the top, counter-clockwise, ending in an arrowhead.
+    let pts: Vec<egui::Pos2> = (0..=18).map(|i| {
+        let a = -std::f32::consts::FRAC_PI_2 - i as f32 / 18.0 * 1.5 * std::f32::consts::PI;
+        pos2(c.x + rad * a.cos(), c.y + rad * a.sin())
+    }).collect();
+    let p = ui.painter();
+    p.add(Shape::line(pts, Stroke::new(1.4, col)));
+    let tip_pt = pos2(c.x + rad, c.y);
+    p.add(Shape::convex_polygon(vec![tip_pt + vec2(-3.0, 1.0), tip_pt + vec2(3.0, 1.0), tip_pt + vec2(0.0, -3.0)], col, Stroke::NONE));
+    r.on_hover_text(tip)
 }
 
 /// The inline curve of an animated parameter; returns a clip-local time when clicked.
