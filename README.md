@@ -49,6 +49,10 @@ installed copies pick it up on their next check.
 - **Inspector**: everything about the selection, every animatable value with keyframe controls, 19 effects
   and 19 transitions from a registry, text (system fonts, outline, shadow, pill background, reveals, karaoke
   highlight) and shapes with draw-on, project and export settings.
+- **Effects**: every effect, transition, title and shape preset as a thumbnail (grid or list with
+  descriptions) rendered by the real renderer from the selected clip at the playhead (or a sample picture
+  when nothing is selected); transitions animate on hover. Hovering an item previews it live in the
+  viewer — on the cut for transitions — and nothing is changed until you click or drop it.
 - **Transcript**: Whisper transcription (or import `words.json` / SRT / VTT sidecars), click a word to seek,
   select words and press Delete to cut them out of the video, captions that stay synced to the voice.
   Word cuts are measured on the audio: each edge moves onto the quietest point near the word times (which
@@ -76,7 +80,8 @@ claude mcp add --transport http aiframes http://127.0.0.1:47675/mcp
 
 49 tools. Typical loop: `changes_since` (what the person did) → `describe_project` → preview footage with
 `contact_sheet {asset}` → `edit` with `plan: true`, then for real → `validate` → `snapshot` / `filmstrip`
-to look → `export`. Edits carry `base_revision` (the revision they were planned against): if the person
+to look → `export`. `preview_effects` shows a clip with each effect or transition added (one labelled
+sheet; nothing is applied), so looks can be compared before choosing one. Edits carry `base_revision` (the revision they were planned against): if the person
 changed something they depend on in the meantime, the edit is refused with what changed instead of
 landing in the wrong place. Text-based editing (`get_transcript`, `delete_words`, `remove_silences`,
 `generate_captions`), analysis (`detect_scenes`, `detect_beats`, `analyze_audio`) and `schema` (every field

@@ -426,7 +426,7 @@ fn interact(ui: &Ui, cx: &EditCtx, it: &Item, resp: egui::Response, out: &mut Ve
             painter.rect_filled(r, CornerRadius::same(4), alpha(it.color, 0.95));
             painter.galley(r.min + vec2(6.0, 3.0), g, Color32::WHITE);
         }
-    } else if resp.hovered() && !ui.ctx().dragged_id().is_some() {
+    } else if resp.hovered() && ui.ctx().dragged_id().is_none() {
         *hovered = Some(it.payload.clone());
     }
     let what = match &it.payload {

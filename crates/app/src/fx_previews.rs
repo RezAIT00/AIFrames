@@ -4,10 +4,12 @@
 //!   playhead, or on a sample scene when no picture clip is selected (or, for transitions, when the
 //!   selected clip has no cut). They are rendered by the one renderer on a scratch copy of the project
 //!   ([`aiframes_mcp::fx_preview`]); the document is never touched, so nothing enters the history.
-//! * **Never in the way of playback or the UI.** One background thread renders, inside its own small
-//!   rayon pool whose threads run at the lowest OS priority (the renderer's inner loops would otherwise
-//!   share the global pool with the playback workers). While the viewer plays it pauses between
-//!   thumbnails. The UI thread only looks up textures.
+//! * **Never in the way of playback or the UI.** One background thread renders, inside its own
+//!   two-thread rayon pool (the renderer's inner loops would otherwise share the global pool with the
+//!   playback workers). Nothing renders while the viewer plays or the playhead is scrubbed: the worker
+//!   waits and resumes on pause (a lower OS priority was tried instead and caused priority inversion:
+//!   a starved thumbnail thread holding a shared renderer/media lock stalled playback for seconds on
+//!   4 cores). The UI thread only looks up textures.
 //! * **Debounced base.** Thumbnails follow the document revision, the selection and the playhead once
 //!   they have been still for a moment (not while playing or scrubbing); old pictures stay up until
 //!   their replacements are ready, so nothing flickers. Only items the browser draws are rendered.
@@ -29,8 +31,6 @@ use std::time::{Duration, Instant};
 pub const THUMB_W: u32 = 256;
 /// How long the playhead/selection must rest before thumbnails follow it.
 const SETTLE: f64 = 0.35;
-/// Pause between thumbnails while the viewer plays.
-const PLAYING_GAP: Duration = Duration::from_millis(60);
 /// Threads of the thumbnail render pool.
 const POOL_THREADS: usize = 2;
 /// Most queued thumbnail requests.
@@ -39,24 +39,6 @@ const MAX_QUEUE: usize = 512;
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
-
-/// Runs the calling thread at the lowest priority (Windows); elsewhere a no-op.
-#[cfg(windows)]
-fn lowest_priority() {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetCurrentThread() -> *mut std::ffi::c_void;
-        fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
-    }
-    const THREAD_PRIORITY_LOWEST: i32 = -2;
-    // SAFETY: documented Win32 calls on the current thread's pseudo-handle; failure is harmless.
-    unsafe {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
-    }
-}
-
-#[cfg(not(windows))]
-fn lowest_priority() {}
 
 /// What the thumbnails are rendered from.
 struct Base {
@@ -114,7 +96,8 @@ struct State {
     thumbs: HashMap<ThumbKey, Tex>,
     queue: VecDeque<ThumbKey>,
     pending: HashSet<ThumbKey>,
-    playing: bool,
+    /// The viewer plays or the playhead is scrubbed: no thumbnail renders until it stops.
+    busy: bool,
     stop: bool,
     /// Thumbnails rendered, their total render ms, and failures (perf log).
     rendered: u64,
@@ -146,8 +129,10 @@ impl FxPreviews {
     }
 
     /// Per UI frame while the effects browser is visible: what the thumbnails should show. `doc` is
-    /// the document's snapshot (not a live preview); `playing`/`scrubbing` hold the base still.
-    pub fn set_base(&mut self, doc: &Arc<Snapshot>, selection: &[Id], playhead: f64, playing: bool, scrubbing: bool, now: f64) {
+    /// the document's snapshot (not a live preview); `playing`/`scrubbing` pause rendering and hold the
+    /// base still; `hold` only holds it (the hover preview moved the playhead).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_base(&mut self, doc: &Arc<Snapshot>, selection: &[Id], playhead: f64, playing: bool, scrubbing: bool, hold: bool, now: f64) {
         let on_clip = preview_plan(&BrowserDrag::Effect("color".into()), &doc.project, &doc.resolved, selection, playhead).is_some();
         let key = BaseKey::new(doc, selection, playhead, on_clip);
         if self.wanted.as_ref().map(|(k, _)| k) != Some(&key) {
@@ -155,15 +140,21 @@ impl FxPreviews {
         }
         let since = self.wanted.as_ref().map(|(_, t)| *t).unwrap_or(now);
         let mut st = lock(&self.inner.st);
-        st.playing = playing;
+        let busy = playing || scrubbing;
+        if st.busy != busy {
+            st.busy = busy;
+            if !busy {
+                self.inner.cv.notify_all();
+            }
+        }
         if st.base.as_ref().map(|b| b.key()).as_ref() == Some(&key) {
             return;
         }
         // The first base at once; later ones once things rest (never while playing or scrubbing: the
         // pictures would chase the playhead).
-        let settled = !playing && !scrubbing && now - since >= SETTLE;
+        let settled = !busy && !hold && now - since >= SETTLE;
         if st.base.is_some() && !settled {
-            if !playing && !scrubbing {
+            if !busy && !hold {
                 self.inner.ctx.request_repaint_after(Duration::from_secs_f64(SETTLE));
             }
             return;
@@ -171,9 +162,11 @@ impl FxPreviews {
         st.next_base += 1;
         let id = st.next_base;
         st.base = Some(Arc::new(Base { id, doc: doc.clone(), selection: selection.to_vec(), playhead, on_clip }));
-        // Requests for the old base are moot; the browser asks again for what it shows.
+        // Requests for the old base are moot; the browser asks again for what it shows. Stills stay up
+        // until their replacements arrive; old animation frames (asked for again on hover) go.
         st.queue.clear();
         st.pending.clear();
+        st.thumbs.retain(|(_, frame), _| *frame == 0);
         drop(st);
         self.inner.cv.notify_all();
     }
@@ -269,17 +262,18 @@ fn at_of(plan: &PreviewPlan, frame: u32) -> f64 {
 }
 
 fn worker(inner: Arc<Inner>) {
-    lowest_priority();
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(POOL_THREADS).thread_name(|n| format!("aiframes-fx-render-{n}")).start_handler(|_| lowest_priority()).build().ok();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(POOL_THREADS).thread_name(|n| format!("aiframes-fx-render-{n}")).build().ok();
     loop {
-        let (base, key, playing) = {
+        let (base, key) = {
             let mut st = lock(&inner.st);
             loop {
                 if st.stop {
                     return;
                 }
-                if let (Some(base), Some(k)) = (st.base.clone(), st.queue.pop_front()) {
-                    break (base, k, st.playing);
+                if !st.busy {
+                    if let (Some(base), Some(k)) = (st.base.clone(), st.queue.pop_front()) {
+                        break (base, k);
+                    }
                 }
                 st = inner.cv.wait(st).unwrap_or_else(|e| e.into_inner());
             }
@@ -314,9 +308,6 @@ fn worker(inner: Arc<Inner>) {
         }
         drop(st);
         inner.ctx.request_repaint();
-        if playing {
-            std::thread::sleep(PLAYING_GAP);
-        }
     }
 }
 
@@ -471,4 +462,80 @@ pub fn draw_note(ctx: &egui::Context, viewer: egui::Rect, note: &str, previewing
     let fill = if previewing { egui::Color32::from_rgba_unmultiplied(0x4C, 0xA3, 0xFF, 230) } else { egui::Color32::from_rgba_unmultiplied(0x30, 0x30, 0x36, 235) };
     painter.rect_filled(r, egui::CornerRadius::same(4), fill);
     painter.galley(r.min + egui::vec2(8.0, 4.0), g, egui::Color32::WHITE);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aiframes_core::{resolve, Project};
+
+    fn wait_for(mut done: impl FnMut() -> bool, secs: u64) -> bool {
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(secs) {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        done()
+    }
+
+    #[test]
+    fn thumbnails_render_in_the_background_and_wait_while_playing() {
+        let dir = std::env::temp_dir().join(format!("aiframes-fxthumbs-{}", std::process::id()));
+        let rd = Arc::new(Renderer::new(aiframes_media::MediaPool::with_cache_dir(64 << 20, &dir)));
+        let ctx = egui::Context::default();
+        let mut fx = FxPreviews::new(ctx, rd);
+        let project: Project = serde_json::from_value(serde_json::json!({
+            "format": 1, "settings": {"width": 1280, "height": 720, "fps": 30},
+            "tracks": [{"id": "v1", "kind": "video"}, {"id": "v2", "kind": "video"}],
+            "clips": [
+                {"id": "c1", "track": "v1", "start": 0, "duration": 4, "source": {"type": "solid", "color": "#2060A0"}},
+                {"id": "c2", "track": "v1", "start": 4, "duration": 4, "source": {"type": "solid", "color": "#C04020"}},
+                {"id": "t", "track": "v2", "start": 0, "duration": 8, "source": {"type": "text", "text": "Hi", "size": 120}}
+            ]
+        }))
+        .unwrap();
+        let resolved = resolve(&project);
+        let snap = Arc::new(Snapshot { doc: 1, revision: 1, epoch: 0, project, resolved, dir: dir.clone() });
+        let items = BrowserDrag::all();
+        let sel = vec!["c1".to_string()];
+
+        // Playing: the browser's requests queue up, nothing renders.
+        fx.set_base(&snap, &sel, 1.0, true, false, false, 0.0);
+        assert!(items.iter().all(|it| fx.thumb(it, 0).is_none()));
+        std::thread::sleep(Duration::from_millis(400));
+        let (n, _, queued, _) = fx.stats();
+        assert_eq!(n, 0, "nothing renders while the viewer plays");
+        assert_eq!(queued, items.len());
+
+        // Paused: every item renders in the background, from the selected clip (on the document).
+        fx.set_base(&snap, &sel, 1.0, false, false, false, 1.0);
+        assert!(wait_for(|| fx.stats().0 + fx.stats().3 >= items.len() as u64, 120), "{:?}", fx.stats());
+        let (n, avg_ms, _, failed) = fx.stats();
+        assert_eq!((n, failed), (items.len() as u64, 0));
+        assert!(fx.source().unwrap().starts_with("c1 at "), "{:?}", fx.source());
+
+        // What the UI thread pays per frame: lookups only.
+        let t0 = Instant::now();
+        for _ in 0..10 {
+            assert!(items.iter().all(|it| fx.thumb(it, 0).is_some()));
+        }
+        let per_frame_us = t0.elapsed().as_secs_f64() * 1e6 / 10.0;
+        assert!(per_frame_us < 5000.0, "{per_frame_us} µs per frame for {} lookups", items.len());
+        eprintln!("{} thumbnails, {avg_ms:.1} ms each in the background; UI lookups {per_frame_us:.0} µs per frame", items.len());
+
+        // Nothing selected: after the selection has rested a moment, the sample scene (written once to
+        // the cache folder); the old pictures stay up meanwhile.
+        fx.set_base(&snap, &[], 1.0, false, false, false, 10.0);
+        assert!(fx.source().unwrap().starts_with("c1"), "not yet: the base is debounced");
+        fx.set_base(&snap, &[], 1.0, false, false, false, 10.0 + SETTLE + 0.01);
+        assert!(fx.source().unwrap().contains("sample"));
+        assert!(items.iter().all(|it| fx.thumb(it, 0).is_some()), "stale pictures stay up while the new ones render");
+        assert!(wait_for(|| fx.stats().0 + fx.stats().3 >= 2 * items.len() as u64, 120), "{:?}", fx.stats());
+        assert_eq!(fx.stats().3, 0, "no failures on the sample");
+        assert!(dir.join("fx-sample").is_dir());
+        drop(fx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
